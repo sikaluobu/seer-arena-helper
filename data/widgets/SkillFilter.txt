@@ -1,0 +1,58 @@
+<div id="filter-panel" style="margin:1em 0;">
+  属性 <select id="filter-attr"><option value="">全部</option></select>
+  类型 <select id="filter-type"><option value="">全部</option></select>
+  威力 ≥ <input type="number" id="filter-power" min="0" max="300" style="width:60px"/>
+  先制 ≥ <input type="number" id="filter-prio" min="-10" max="10" style="width:60px"/>
+  <button type="button" onclick="window.applySkillFilter()">筛选</button>
+  <button type="button" onclick="window.clearSkillFilter()">重置</button>
+</div>
+
+<script>
+/* 动态生成下拉选项 */
+function buildSelect(collectKey, selectId) {
+  const list = Array.from(document.querySelectorAll('.skill-card'))
+                    .map(card => card.dataset[collectKey])
+                    .filter(Boolean);
+  const uniq = [...new Set(list)].sort();
+  const sel  = document.getElementById(selectId);
+  // 保留“全部”
+  sel.innerHTML = '<option value="">全部</option>';
+  uniq.forEach(v => {
+    const opt = document.createElement('option');
+    opt.value = v;
+    opt.textContent = v;
+    sel.appendChild(opt);
+  });
+}
+
+/* 筛选逻辑（不变） */
+window.applySkillFilter = function() {
+  const a = document.getElementById('filter-attr').value,
+        t = document.getElementById('filter-type').value,
+        p = parseInt(document.getElementById('filter-power').value) || 0,
+        r = parseInt(document.getElementById('filter-prio').value) || -999;
+  document.querySelectorAll('.skill-card').forEach(el => {
+    const ok = (!a || el.dataset.attr === a) &&
+               (!t || el.dataset.type === t) &&
+               (parseInt(el.dataset.power) >= p) &&
+               (parseInt(el.dataset.prio) >= r);
+    el.style.display = ok ? '' : 'none';
+  });
+};
+
+window.clearSkillFilter = function() {
+  document.querySelectorAll('#filter-panel input,#filter-panel select').forEach(el => el.value = '');
+  window.applySkillFilter();
+};
+
+document.addEventListener('DOMContentLoaded', function () {
+  buildSelect('attr', 'filter-attr');
+  buildSelect('type', 'filter-type');
+  window.applySkillFilter();          // 初始过滤一次（可选）
+
+  const panel = document.getElementById('filter-panel');
+  /* 任何 change/input 都触发 */
+  panel.addEventListener('change', window.applySkillFilter);
+  panel.addEventListener('input',   window.applySkillFilter);
+});
+</script>

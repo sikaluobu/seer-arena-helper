@@ -1,0 +1,22 @@
+# 抓取缓存与构建产物
+data/cache/
+data/shots/
+data/seer.db
+data/fake_battle.png
+build/
+dist/
+release/
+*.spec.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

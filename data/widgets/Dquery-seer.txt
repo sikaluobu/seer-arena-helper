@@ -1,0 +1,205 @@
+<script>
+/*转载自 https://wiki.biligame.com/evertale/MediaWiki:Dquery.js*/
+let queryProperty = paramsFormmatter($("#queryProperty").text(), "|?");
+let defaultSearch = $("#defaultSearch").text();
+let queryTemplate = $("#queryTemplate").text();
+let headerText = $("#headerText").text();
+let footerText = $("#footerText").text();
+
+function getconditions() {
+	//遍历data-type的元素，生成对应的分类查询参数
+	let CategoryCondition = $("[data-type='Category']").find(".active, .DQselectd, input")
+		.map(function () {
+			let value;
+			if ($(this).hasClass('active')) {
+				value = $(this).data('conditions');
+			} else if ($(this).hasClass('DQselectd') && $(this).val() === "全部") {
+				value = null;
+			} else {
+				value = $(this).val() || $(this).text();
+			}
+			return value ? `[[分类:${value}]]` : null;
+		}).get().filter(Boolean).join("");
+	//遍历data-type的元素，生成对应的属性查询参数
+	let PropertyCondition = $("[data-type='Property']").find(".active, .DQselectd, input")
+		.map(function () {
+			let key = $(this).attr("data-property") || $(this).parent().attr("data-property");
+			let value = $(this).hasClass('active') ? $(this).data('conditions') : ($(this).val() || $(this).text());
+			if (value && !($(this).hasClass('DQselectd') && value === "全部")) {
+				if ($(this).is('input')) {
+					return { key, value: "~*" + value + "*" };
+				} else {
+					return { key, value };
+				}
+			}
+		})
+		.get()
+		.reduce((acc, { key, value }) => {
+			if (!acc[key]) acc[key] = [];
+			acc[key].push(value);
+			return acc;
+		}, {});
+	let PropertyConditionlength = Object.keys(PropertyCondition).length;
+	PropertyCondition = Object.entries(PropertyCondition)
+		.map(([key, value]) => `[[${key}::${value.join('||')}]]`)
+		.join('');
+	if (CategoryCondition === "" && PropertyCondition === "") {
+		alert("没有指定查询条件");
+	}
+	else if (PropertyConditionlength > 7) {
+		alert("超出查询条件，最多支持7个属性查询");
+	}
+	else {
+		Condition = CategoryCondition + PropertyCondition;
+	}
+	return Condition;
+}
+
+function queryData(conditions, limit) {
+	$.getJSON(mw.util.wikiScript('api'), {
+		format: 'json',
+		action: 'parse',
+		text: '{' + '{#ask:' + conditions + '|format=count}}',
+		contentmodel: 'wikitext'
+	}).done(function (data) {
+		count = parseInt($(data.parse.text["*"]).text());
+		$("#queryCount").text(count);
+		$("#queryLimit").text(limit);
+		refreshPager(count, limit, 1);
+		getPageData(conditions, limit, 1);
+	});
+}
+
+function getPageData(conditions, limit, page) {
+	limit = Number(limit);
+	page = Number(page);
+	let sort = $("[data-type='sort']").find(".active, .DQselectd").text() || "";
+	let orderText = $("[data-type='order']").find(".active, .DQselectd").text();
+	let order = orderText.replaceAll("降序", "desc").replaceAll("升序", "asc").replaceAll("随机", "rand");
+	let parameters = "|template=" + queryTemplate + "|sort=" + sort + "|order=" + order + "|limit=" + limit + "|offset=" + (page - 1) * limit + "|headers=hide|searchlabel=|format=template|link=none";
+	let queryText = headerText + '{{#ask:' + conditions + queryProperty + parameters + '}}' + footerText;
+	$.getJSON(mw.util.wikiScript('api'), {
+		format: 'json',
+		action: 'parse',
+		text: queryText,
+		contentmodel: 'wikitext'
+	}).done(function (data) {
+		$("#queryDataGrid").html(data.parse.text["*"]);
+		// 【新增】结果内所有链接统一新标签页打开（带安全 rel）
+		$("#queryDataGrid a").attr({
+			target: "_blank",
+			rel: "noopener noreferrer"
+		});
+	});
+}
+
+function refreshPager(count, limit, page) {
+	var sumPage = Math.min(Math.ceil(Number(count) / Number(limit)));
+	page = Number(page);
+	page = page === 0 ? 1 : page;
+	page = page < 0 ? sumPage : page;
+	var pageStart = Math.max(1, page - 2);
+	var pageEnd = Math.min(Math.ceil(count / limit), pageStart + 4);
+	pageStart = pageEnd <= 5 ? 1 : pageStart;
+	var $a = $("<a>").attr({ href: "javascript:void(0);" });
+	var btnArray = [];
+	for (var i = pageStart; i <= pageEnd; i++) {
+		btnArray.push($("<li>").attr({ class: "gridPageBtn" + (page === i ? " active" : "") }).append($a.clone().text(i)));
+	}
+	$(".gridPageBtn").remove();
+	$(".pagination li:first-child").after(btnArray);
+	$(".gridFirstPageBtn")[page === 1 ? "addClass" : "removeClass"]("hide");
+	$(".gridLastPageBtn")[page === sumPage || pageEnd === 1 ? "addClass" : "removeClass"]("hide");
+	document.body.scrollTop = $("#queryDataGrid").offset().top - 100;
+	return page;
+}
+
+function paramsFormmatter(param, connector) {
+	return ("、" + param).split("、").join(connector);
+}
+
+(window.RLQ = window.RLQ || []).push([["jquery"], function () {
+	$(function () {
+		// 隐藏错误提示
+		$("#JSerror").addClass("hide");
+		// 显示查询按钮
+		$("#queryData").removeClass("hide");
+
+		// 将 .DQinput 替换为可输入的 input 框
+		$(".DQinput").each(function () {
+			$(this).replaceWith('<input value="' + $(this).text() + '" class="DQinput form-control" data-conditions="' + $(this).text() + '" style="width:auto;" placeholder="支持模糊查询"/>');
+		});
+
+		// 同步 input 值到 data-conditions
+		$(".DQinput").on('input', function () {
+			$(this).attr("data-conditions", $(this).val());
+		});
+
+		// DQselect 下拉选择
+		$(".DQselect li").click(function () {
+			$(this).parent().parent().find(".DQselectd").text($(this).text());
+			$(this).parent().parent().find(".DQselectd").attr("data-conditions", $(this).text());
+		});
+
+		// 单选按钮互斥
+		$(".Single div").click(function () {
+			$(this).siblings().removeClass("active");
+		});
+
+		// 查询按钮点击事件
+		$("#queryData").click(function () {
+			let Condition = getconditions();
+			let limit = $("[data-type='limit']").find(".DQselectd").text() || 200;
+			queryData(Condition, limit);
+		});
+
+		// 清除条件
+		$("#clearConditions").click(function () {
+			$(".active").not(".disabled, .hide *").removeClass("active");
+			$(".DQinput").val("").attr("data-conditions", "");
+			$("[data-type='Property'], [data-type='Category']").find(".DQselectd").text("全部").attr("data-conditions", "全部");
+		});
+
+		// 分页与清除参数事件委托
+		$("body")
+			.on("click", "#clearParamBtn", function () {
+				$(".selected").removeClass("selected");
+			})
+			.on("click", ".gridPageBtn, .gridFirstPageBtn, .gridLastPageBtn", function () {
+				if ($(this).hasClass("hide") || $(this).hasClass("active")) return false;
+				var page = $(this).attr("data-page") || $(this).text();
+				let limit = $("[data-type='limit']").find(".DQselectd").text() || 200;
+				let Condition = getconditions();
+				getPageData(Condition, limit, refreshPager(count, limit, page));
+			});
+
+		// >>>>>>>>>>>>>>>>>> 新增：从URL读取 title 参数并自动填充查询 <<<<<<<<<<<<<<<<<<
+		const url = window.location.href;
+		if (url.includes('?')) {
+			const urlParams = new URLSearchParams(window.location.search);
+			if (urlParams.has('title')) {
+				const titleValue = urlParams.get('title');
+				const $input = $('input.DQinput.form-control').first(); // 取第一个输入框（通常用于名称/标题）
+				if ($input.length) {
+					$input.val(titleValue).trigger('input'); // 更新值并触发 input 事件
+					setTimeout(() => {
+						$('#queryData').trigger('click'); // 触发查询
+					}, 30); // 微延迟确保 DOM 稳定
+				}
+			}
+		}
+
+		// 默认自动查询（如果配置了）
+		let Condition = getconditions();
+		let limit = $("[data-type='limit']").find(".DQselectd").text() || 200;
+		if (defaultSearch === "true" || defaultSearch === "1" || defaultSearch === "查询") {
+			queryData(Condition, limit);
+		}
+	});
+}]);
+
+/*加载Bikit*/
+try {
+	mw.loader.load('//wiki.biligame.com/wiki/MediaWiki:Bikit.js?action=raw&ctype=text/javascript');
+} catch(e) {}
+</script>

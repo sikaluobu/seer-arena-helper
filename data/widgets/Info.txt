@@ -1,0 +1,112 @@
+<script>
+(window.RLQ = window.RLQ || []).push(['jquery', () => {
+    $(document).ready(function () {
+$('div[data-type="canvas"]').each(function () {
+    let $div = $(this);
+    let html = $div.text('')[0].outerHTML;
+    html = html.replace('<div', "<canvas ")
+        .replace('></div>', ' />');
+
+    let $hex = $(html);
+    $hex[0].height = $hex.data('height') || 200;
+    $hex[0].width = $hex.data('width') || 225;
+
+    $div.replaceWith($hex);
+
+    let ability_value = [];
+    let ability_name = [];
+    let stagesNum = $div.data('stages');
+    let canvasInfo = $div.data('value').split('|');
+    $.each(canvasInfo, function (i, val) {
+        let data = val.split('_');
+        ability_value.push(data[0] || 0);
+        ability_name.push(data[1]);
+    });
+    let sourceValue = $div.data('source');
+    let correctionValue = 0;
+    switch (sourceValue) {
+        case 'Monster':
+            correctionValue=200;
+            break;
+        case 'MintMark':
+            correctionValue=150;
+            break;
+        default :
+            break;
+
+    }
+    polygon($hex[0], canvasInfo.length, stagesNum, ability_value, ability_name, correctionValue/5);
+});
+
+// 绘制多边形图
+function polygon(obj, side, part, ability_value, ability_name, correctionValue) {
+    let ability = obj.getContext('2d');
+    ability.canvas.width = obj.width;
+    ability.canvas.height = obj.height;
+    let width = obj.width;
+    let height = obj.height;
+    let xCenter = width * 0.5;
+    let yCenter = height * 0.5;
+    let radius = width * 0.3;
+    let space = radius / part;
+    let theta = Math.PI * 2 / side;
+
+    //绘制渐变多边形底层
+    for (let j = part; j >= 1; j--) {
+        ability.beginPath();
+        for (let i = 0; i <= side; i++) {
+            ability.lineTo(Math.cos(i * theta) * space * j + xCenter, -Math.sin(i * theta) * space * j + yCenter);
+        }
+        ability.lineWidth = 1;
+        //边线
+        ability.strokeStyle = "rgba(0,255,255,0.2)";
+        ability.stroke();
+        // ability.fillStyle = "rgba(" + r + "," + g + "," + b + "," + a + ")";
+        ability.fillStyle = "rgba(11,124,211,0.4)"
+        ability.fill();
+        ability.closePath();
+        for (let i = 0; i <= side; i++) {
+            ability.beginPath();
+            ability.moveTo(xCenter, yCenter);
+            ability.lineTo(Math.cos(i * theta) * space * j + xCenter, -Math.sin(i * theta) * space * j + yCenter);
+            ability.stroke();
+            ability.closePath();
+        }
+    }
+
+    //绘制能力多边形
+    ability.beginPath();
+    for (let i = 0; i <= side; i++) {
+        let x = Math.cos(i * theta) * radius * (ability_value[i % side] / part / correctionValue) + xCenter;
+        let y = -Math.sin(i * theta) * radius * (ability_value[i % side] / part / correctionValue) + yCenter;
+        ability.lineTo(x, y);
+    }
+    ability.closePath();
+    ability.fillStyle = "rgba(119,241,255,0.5)";
+    ability.fill();
+
+
+    //绘制字体
+    for (let i = 0; i < side; i++) {
+        ability.fillStyle = "rgba(255,255,255,1)";
+        ability.font = "normal 15px Microsoft Yahei";
+        let x;
+        if (Math.cos(i * theta) * radius > 0) {
+            if (i === 0) {
+                ability.textAlign = 'left'
+                x = Math.cos(i * theta) * radius + xCenter + 3;
+            } else {
+                ability.textAlign = 'center'
+                x = Math.cos(i * theta) * radius + xCenter + 3;
+            }
+        } else {
+            ability.textAlign = 'left'
+            x = Math.cos(i * theta) * radius * 1.5 + xCenter;
+        }
+        let y = -Math.sin(i * theta) * radius * 1.3 + yCenter;
+        ability.fillText(ability_name[i], x, y + 6);
+    }
+}
+})
+}]);
+</script>

@@ -1,0 +1,14 @@
+# ---- 运行时核心（爬虫/判断引擎）----
+requests>=2.31
+
+# ---- 悬浮窗 ----
+PySide6>=6.6          # Qt for Python，体积约 60-80MB，可裁到 ~40MB
+# 备选（更小但功能少）：tkinter 随 Python 自带，零额外体积
+
+# ---- OCR ----
+paddlepaddle>=2.6
+paddleocr>=2.7
+
+# ---- 备用 ----
+Pillow>=10.0          # 截图与头像模板处理
+numpy>=1.24

@@ -1,0 +1,424 @@
+<script>
+/*转载自 https://wiki.biligame.com/evertale/MediaWiki:Dquery.js */
+
+// ==================== 新增：顶部缓存变量 ====================
+let pageTitleStore = [];     // 存储所有页面标题
+let pageDetailCache = {};    // 存储已加载页面的详细数据
+let currentCategory = "";    // 当前分类
+let currentQueryConditions = ""; // 新增：存储完整的查询条件
+
+// ==================== 原有代码不变 ====================
+let queryProperty = paramsFormmatter($("#queryProperty").text(), "|?");
+let defaultSearch = $("#defaultSearch").text();
+let queryTemplate = $("#queryTemplate").text();
+let headerText = $("#headerText").text();
+let footerText = $("#footerText").text();
+
+function getconditions() {
+	let CategoryCondition = $("[data-type='Category']").find(".active, .DQselectd, input")
+		.map(function () {
+			let value;
+			if ($(this).hasClass('active')) {
+				value = $(this).data('conditions');
+			} else if ($(this).hasClass('DQselectd') && $(this).val() === "全部") {
+				value = null;
+			} else {
+				value = $(this).val() || $(this).text();
+			}
+			return value ? `[[分类:${value}]]` : null;
+		}).get().filter(Boolean).join("");
+	
+	let PropertyCondition = $("[data-type='Property']").find(".active, .DQselectd, input")
+		.map(function () {
+			let key = $(this).attr("data-property") || $(this).parent().attr("data-property");
+			let value = $(this).hasClass('active') ? $(this).data('conditions') : ($(this).val() || $(this).text());
+			if (value && !($(this).hasClass('DQselectd') && value === "全部")) {
+				if ($(this).is('input')) {
+					return { key, value: "~*" + value + "*" };
+				} else {
+					return { key, value };
+				}
+			}
+		})
+		.get()
+		.reduce((acc, { key, value }) => {
+			if (!acc[key]) acc[key] = [];
+			acc[key].push(value);
+			return acc;
+		}, {});
+	
+	let PropertyConditionlength = Object.keys(PropertyCondition).length;
+	PropertyCondition = Object.entries(PropertyCondition)
+		.map(([key, value]) => `[[${key}::${value.join('||')}]]`)
+		.join('');
+	
+	if (CategoryCondition === "" && PropertyCondition === "") {
+		alert("没有指定查询条件");
+	}
+	else if (PropertyConditionlength > 7) {
+		alert("超出查询条件，最多支持7个属性查询");
+	}
+	else {
+		Condition = CategoryCondition + PropertyCondition;
+	}
+	return Condition;
+}
+
+// ==================== 修改：queryData函数（存储完整条件） ====================
+function queryData(conditions, limit) {
+	const categoryMatch = conditions.match(/\[\[分类:(.+?)\]\]/);
+	const newCategory = categoryMatch ? categoryMatch[1] : "";
+	
+	// ========= 关键：存储完整查询条件 =========
+	currentQueryConditions = conditions;
+	
+	if (newCategory && currentCategory !== newCategory) {
+		currentCategory = newCategory;
+		pageTitleStore = [];
+		pageDetailCache = {};
+		
+		$("#queryDataGrid").html('<div style="padding:20px;text-align:center;color:#999;">正在加载页面列表...</div>');
+		
+		loadAllPageTitles(newCategory, function(titles) {
+			pageTitleStore = titles;
+			console.log(`[页面列表] 共${titles.length}条`);
+			executeFrontendQueryStreaming(conditions, limit, 1);
+		});
+		return;
+	}
+	
+	if (pageTitleStore.length > 0) {
+		executeFrontendQueryStreaming(conditions, limit, 1);
+		return;
+	}
+	
+	// 保底方案
+	$.getJSON(mw.util.wikiScript('api'), {
+		format: 'json',
+		action: 'parse',
+		text: '{' + '{#ask:' + conditions + '|format=count}}',
+		contentmodel: 'wikitext'
+	}).done(function (data) {
+		count = parseInt($(data.parse.text["*"]).text());
+		$("#queryCount").text(count);
+		$("#queryLimit").text(limit);
+		refreshPager(count, limit, 1);
+		getPageData(conditions, limit, 1);
+	});
+}
+
+// ==================== 修改：getPageData函数 ====================
+function getPageData(conditions, limit, page) {
+	limit = Number(limit);
+	page = Number(page);
+	
+	if (pageTitleStore.length > 0) {
+		const start = (page - 1) * limit;
+		const end = Math.min(start + limit, pageTitleStore.length);
+		const pageTitles = pageTitleStore.slice(start, end);
+		// ========= 关键：传入完整条件 =========
+		loadPageDetailsStreaming(pageTitles, conditions, limit, page);
+		return;
+	}
+	
+	// 原有逻辑不变
+	let sort = $("[data-type='sort']").find(".active, .DQselectd").text() || "";
+	let orderText = $("[data-type='order']").find(".active, .DQselectd").text();
+	let order = orderText.replaceAll("降序", "desc").replaceAll("升序", "asc").replaceAll("随机", "rand");
+	let parameters = "|template=" + queryTemplate + "|sort=" + sort + "|order=" + order + "|limit=" + limit + "|offset=" + (page - 1) * limit + "|headers=hide|searchlabel=|format=template|link=none";
+	let queryText = headerText + '{{#ask:' + conditions + queryProperty + parameters + '}}' + footerText;
+	
+	$.getJSON(mw.util.wikiScript('api'), {
+		format: 'json',
+		action: 'parse',
+		text: queryText,
+		contentmodel: 'wikitext'
+	}).done(function (data) {
+		$("#queryDataGrid").html(data.parse.text["*"]);
+	});
+}
+
+// ==================== 原有函数不变 ====================
+function refreshPager(count, limit, page) {
+	var sumPage = Math.min(Math.ceil(Number(count) / Number(limit)));
+	page = Number(page);
+	page = page === 0 ? 1 : page;
+	page = page < 0 ? sumPage : page;
+	var pageStart = Math.max(1, page - 2);
+	var pageEnd = Math.min(Math.ceil(count / limit), pageStart + 4);
+	pageStart = pageEnd <= 5 ? 1 : pageStart;
+	var $a = $("<a>").attr({ href: "javascript:void(0);" });
+	var btnArray = [];
+	for (var i = pageStart; i <= pageEnd; i++) {
+		btnArray.push($("<li>").attr({ class: "gridPageBtn" + (page === i ? " active" : "") }).append($a.clone().text(i)));
+	}
+	$(".gridPageBtn").remove();
+	$(".pagination li:first-child").after(btnArray);
+	$(".gridFirstPageBtn")[page === 1 ? "addClass" : "removeClass"]("hide");
+	$(".gridLastPageBtn")[page === sumPage || pageEnd === 1 ? "addClass" : "removeClass"]("hide");
+	document.body.scrollTop = $("#queryDataGrid").offset().top - 100;
+	return page;
+}
+
+function paramsFormmatter(param, connector) {
+	return ("、" + param).split("、").join(connector);
+}
+
+// ==================== 新增：7个核心函数（文件末尾） ====================
+
+function loadAllPageTitles(category, callback) {
+	let allTitles = [];
+	let continueParam = null;
+	
+	function fetchBatch() {
+		const params = {
+			format: 'json',
+			action: 'query',
+			list: 'categorymembers',
+			cmtitle: `分类:${category}`,
+			cmlimit: 500,
+			formatversion: 2
+		};
+		
+		if (continueParam) params.cmcontinue = continueParam;
+		
+		$.getJSON(mw.util.wikiScript('api'), params).done(function(data) {
+			const members = data.query.categorymembers || [];
+			allTitles.push(...members.map(m => m.title));
+			
+			if (data.continue && data.continue.cmcontinue) {
+				continueParam = data.continue.cmcontinue;
+				setTimeout(fetchBatch, 50);
+			} else {
+				callback(allTitles);
+			}
+		}).fail(function() {
+			alert('加载页面列表失败');
+			callback([]);
+		});
+	}
+	
+	fetchBatch();
+}
+
+function executeFrontendQueryStreaming(conditions, limit, page) {
+	if (pageTitleStore.length === 0) {
+		queryDataFallback(conditions, limit);
+		return;
+	}
+	
+	const start = (page - 1) * limit;
+	const end = Math.min(start + limit, pageTitleStore.length);
+	const pageTitles = pageTitleStore.slice(start, end);
+	
+	loadPageDetailsStreaming(pageTitles, conditions, limit, page);
+}
+
+function loadPageDetailsStreaming(titles, conditions, limit, page) {
+	// ========= 关键：解析条件和属性 =========
+	const properties = $("#queryProperty").text().split("、").filter(p => p.trim());
+	const propQuery = properties.map(p => `|?${p}`).join('');
+	
+	// 从conditions提取属性筛选条件（不包含页面名和分类）
+	const attrConditions = extractAttributeConditions(conditions);
+	
+	$("#queryDataGrid").html(`
+		<div style="padding:20px;">
+			<div style="display:flex;align-items:center;margin-bottom:20px;">
+				<span>正在逐条验证并加载数据...</span>
+				<span id="loadingProgress" style="margin-left:10px;color:#999;">0 / ${titles.length}</span>
+			</div>
+			<div id="streamingResults"></div>
+		</div>
+	`);
+	
+	const resultsContainer = $("#streamingResults");
+	const CONCURRENT = 3;
+	let loadedCount = 0;
+	let activeRequests = 0;
+	let currentIndex = 0;
+	let filteredCount = 0; // 统计筛选后的数量
+	
+	function processQueue() {
+		while (activeRequests < CONCURRENT && currentIndex < titles.length) {
+			activeRequests++;
+			const index = currentIndex++;
+			const title = titles[index];
+			
+			// ========= 关键：构建包含分类和属性的完整查询 =========
+			const askQuery = `[[${title}]]${attrConditions}${propQuery}|format=json`;
+			
+			const onComplete = function() {
+				activeRequests--;
+				loadedCount++;
+				$("#loadingProgress").text(`${loadedCount} / ${titles.length}`);
+				
+				if (currentIndex >= titles.length && activeRequests === 0) {
+					setTimeout(() => {
+						$("#loadingProgress").parent().html(`<div style="color:#999;margin-bottom:10px;">加载完成：匹配 ${filteredCount} / ${titles.length} 条</div>`);
+					}, 500);
+				}
+				
+				processQueue();
+			};
+			
+			loadSinglePageDetail(askQuery, function(pageData) {
+				if (pageData) {
+					// 验证是否满足所有条件（二次检查）
+					pageDetailCache[title] = pageData;
+					renderSingleItem(pageData, function(html) {
+						resultsContainer.append(html);
+						filteredCount++; // 统计有效结果
+					});
+				}
+				onComplete();
+			});
+		}
+	}
+	
+	processQueue();
+}
+
+function extractAttributeConditions(conditions) {
+	// 从conditions中提取属性条件（[[属性::值]]），排除[[分类:...]]和页面名
+	return conditions.replace(/\[\[分类:[^\]]+\]\]/g, '');
+}
+
+// ========= 关键修改：loadSinglePageDetail接收完整askQuery =========
+function loadSinglePageDetail(askQuery, callback) {
+	$.getJSON(mw.util.wikiScript('api'), {
+		format: 'json',
+		action: 'ask',
+		query: askQuery,
+		formatversion: 2
+	}).done(function(data) {
+		const results = data.query.results || {};
+		const pageName = Object.keys(results)[0];
+		
+		if (!pageName || !results[pageName]) {
+			callback(null);
+			return;
+		}
+		
+		const pageData = results[pageName];
+		const properties = $("#queryProperty").text().split("、").filter(p => p.trim());
+		const row = { pageName: pageName };
+		
+		properties.forEach(prop => {
+			const printouts = pageData.printouts[prop] || [];
+			row[prop] = printouts.join(', ');
+		});
+		
+		callback(row);
+	}).fail(function() {
+		callback(null);
+	});
+}
+
+function renderSingleItem(pageData, callback) {
+	// 安全获取属性列表
+	var propList;
+	if (typeof queryPropertyList !== 'undefined') {
+		propList = queryPropertyList;
+	} else {
+		// 备选方案：动态读取
+		propList = $("#queryProperty").text().split("、").filter(Boolean);
+	}
+	
+	// 生成位置参数（空出参数1）
+	const args = propList.map(function(prop) {
+		return '|' + (pageData[prop] || '');
+	}).join('');
+	
+	// 模板调用（参数1为空）
+	const templateCall = '{{' + queryTemplate + '|' + args + '}}';
+	
+	$.getJSON(mw.util.wikiScript('api'), {
+		format: 'json',
+		action: 'parse',
+		text: templateCall,
+		contentmodel: 'wikitext'
+	}).done(function(data) {
+		callback(data.parse.text["*"]);
+	}).fail(function() {
+		callback('<div style="color:red;">渲染失败</div>');
+	});
+}
+function queryDataFallback(conditions, limit) {
+	$.getJSON(mw.util.wikiScript('api'), {
+		format: 'json',
+		action: 'parse',
+		text: '{' + '{#ask:' + conditions + '|format=count}}',
+		contentmodel: 'wikitext'
+	}).done(function (data) {
+		count = parseInt($(data.parse.text["*"]).text());
+		$("#queryCount").text(count);
+		$("#queryLimit").text(limit);
+		refreshPager(count, limit, 1);
+		getPageData(conditions, limit, 1);
+	});
+}
+
+// ==================== 原有初始化代码不变 ====================
+(window.RLQ = window.RLQ || []).push([["jquery"], function () {
+	$(function () {
+		$("#JSerror").addClass("hide");
+		$("#queryData").removeClass("hide");
+		
+		$(".DQinput").each(function () {
+			$(this).replaceWith('<input value="' + $(this).text() + '" class="DQinput form-control" data-conditions="' + $(this).text() + '" style="width:auto;" placeholder="支持模糊查询"/>');
+		});
+		
+		$(".DQinput").on('input', function () {
+			$(this).attr("data-conditions", $(this).val());
+		});
+		
+		$(".DQselect li").click(function () {
+			$(this).parent().parent().find(".DQselectd").text($(this).text());
+			$(this).parent().parent().find(".DQselectd").attr("data-conditions", $(this).text());
+		});
+		
+		$(".Single div").click(function () {
+			$(this).siblings().removeClass("active");
+		});
+		
+		$("#queryData").click(function () {
+			let Condition = getconditions();
+			let limit = $("[data-type='limit']").find(".DQselectd").text() || 200;
+			queryData(Condition, limit);
+		});
+		
+		$("#clearConditions").click(function () {
+			$(".active").not(".disabled, .hide *").removeClass("active");
+			$(".DQinput").val("").attr("data-conditions", "");
+			$("[data-type='Property'], [data-type='Category']").find(".DQselectd").text("全部").attr("data-conditions", "全部");
+			pageTitleStore = [];
+			pageDetailCache = {};
+			currentCategory = "";
+			currentQueryConditions = "";
+		});
+		
+		$("body")
+			.on("click", "#clearParamBtn", function () {
+				$(".selected").removeClass("selected")
+			})
+			.on("click", ".gridPageBtn, .gridFirstPageBtn, .gridLastPageBtn", function () {
+				if ($(this).hasClass("hide") || $(this).hasClass("active")) return false;
+				var page = $(this).attr("data-page") || $(this).text();
+				let limit = $("[data-type='limit']").find(".DQselectd").text() || 200;
+				let Condition = getconditions();
+				
+				getPageData(Condition, limit, page);
+				refreshPager(count, limit, page);
+			});
+		
+		$(document).ready(function () {
+			let Condition = getconditions();
+			let limit = $("[data-type='limit']").find(".DQselectd").text() || 200;
+			if (defaultSearch === "true" || defaultSearch === "1" || defaultSearch === "查询") queryData(Condition, limit);
+		});
+	})
+}])
+
+try { mw.loader.load('//wiki.biligame.com/wiki/MediaWiki:Bikit.js?action=raw&ctype=text/javascript');} catch(e) {}
+</script>

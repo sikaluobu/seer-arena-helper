@@ -1,0 +1,55 @@
+{{面包屑}}
+{{魂印图鉴导航}}
+{| class="wikitable" style="width:100%"
+|-
+|style="display:none;"|{{动态查询|单选组|分类|魂印|魂印|隐藏}}
+|-
+!width="90"|内容检索
+|-
+|{{动态查询|输入|魂印ID|}}{{动态查询|输入|魂印名称|}}{{动态查询|输入|魂印效果|}}
+|}
+{{动态查询|查询|查询结果}}
+<div class="pull-left">
+{{动态查询|统计}}、
+{{动态查询|限额|30|100、50、30、10|}}
+{{动态查询|项目|魂印ID、魂印图标、魂印名称、魂印效果}}
+{{动态查询|排序|魂印ID|魂印ID、参数个数|}}
+{{动态查询|升降|降序|升序、降序|}}
+{{动态查询|模板|魂印数据列表1}}
+{{动态查询|清空|清空条件}}
+</div>
+{{动态查询|分页}}
+<div class="divsort" id="title"><span class="d">ID</span><span class="d">图标</span><span class="d">效果</span></div>
+<div class="wikitable" id="queryDataGrid" style="margin-top:10px"></div>
+{{动态查询|分页}}
+{{动态查询|默认|1}}
+{{#css:
+.DQbtn{display:grid;grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));grid-auto-flow: dense;gap: 5px;}
+div#queryDataGrid>div.mw-parser-output{display:flex;flex-wrap:wrap;gap:4px;}
+#queryData{width:100%;}
+.jztj_box{transition:box-shadow 0.3s;}
+.jztj_box:hover{box-shadow: 3px 3px 4px gray;}
+}}
+{{#if:{{#varexists:防止多次加载CSS}}||{{#vardefineecho:防止多次加载CSS|{{#tag:bstyle|
+.btn-default {background: url(https://patchwiki.biligame.com/images/seer/0/0c/3c70xama0pgym9t19ffaxujp2llacls.png) !important;background-size: 100% 100% !important;margin-right: 6px !important;color: #ffffff;}
+.btn{border: none !important;border-radius: 0px;}
+.btn-default.active, .btn-default:active, .open>.dropdown-toggle.btn-default {background: url(https://patchwiki.biligame.com/images/seer/c/cc/79rcvuiqcmdity4nzk1k3uvesrt6ktf.png)!important;border-radius: 0 !important;color: #ffffff !important;background-size: 100% 100% !important;}
+.btn-default:hover {color: #333;background-color: #e6e6e6;border-color: #adadad;background: url(https://patchwiki.biligame.com/images/seer/c/cc/79rcvuiqcmdity4nzk1k3uvesrt6ktf.png)!important;border-radius: 0 !important;color: #ffffff !important;background-size: 100% 100% !important;}
+li.btn.queryParams.selected {background: url(https://patchwiki.biligame.com/images/seer/c/cc/79rcvuiqcmdity4nzk1k3uvesrt6ktf.png)!important;border-radius: 0 !important;color: #ffffff !important;background-size: 100% 100% !important;-webkit-box-shadow: none;box-shadow: none;}
+span#queryDataBtn {background: url(https://patchwiki.biligame.com/images/seer/9/9b/39fad2ju6h32vfr0lhdqukikz7hs7r3.png) !important;background-size: 100% 100% !important;margin-right: 6px !important;}
+span#queryDataBtn:hover {background: url(https://patchwiki.biligame.com/images/seer/c/cf/ckxusxyerridsml55dpoldablgpttxo.png) !important; background-size: 100% 100% !important;margin-right: 6px !important;}
+
+
+.divsort {display: flex;align-items: center;gap: 10px;padding: 4px 8px;font-family: "Segoe UI", sans-serif;border-bottom: 1px solid #333;background: #0a0a0a;color: #eee;width: 100%;}
+.divsort .d {min-width: 40px;text-align: center;font-variant-numeric: tabular-nums;}
+.divsort .d:nth-child(2) { min-width: 100px; } /* 精灵名 */
+.divsort .d:nth-child(3) { min-width: 80px;  } /* 属性图标+文字 */
+.divsort .total {color: #ffcc00;font-weight: bold;}
+.divsort {display: flex;align-items: center;border-bottom: 1px solid #555;      /* 行线 */}
+.divsort .d {min-width: 40px;text-align: center;font-variant-numeric: tabular-nums;padding: 4px 6px;border-right: 1px solid #444;    width: 50%;       /* 列线 */}
+.divsort .d:last-child { border-right: none; } /* 最后一列去掉多余竖线 */
+.divsort {    width: 100%;background: rgb(19 19 19 / 69%);color: #ffffff;}
+.divsort#title {    background: rgb(19 19 19 / 91%);    font-weight: bold;}
+}}}}}}
+{{#Widget:Dquery}}
+{{#Widget:模糊搜索回车功能}}

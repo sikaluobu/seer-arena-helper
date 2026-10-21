@@ -1,0 +1,1663 @@
+<script src="https://wiki.biligame.com/data/index.php?title=MediaWiki:Api.js&action=raw&ctype=text/javascript"></script>
+<div id="stats-viewer"></div>
+<script>
+/*!
+ * stats-viewer.js — 全站用户行为统计报表（读取端，与 analytics.js 写入端完全独立）
+ *
+ * 数据来源（与 analytics.js 完全一致，仅读取）：
+ *   主路径   用户讨论:GLOBAL/analytics_summary_{站点}.json（及超量时的 users 分片）
+ *            -> { total, uniqueUsers, days, pages, users }，直接聚合，无需扫描分片
+ *   回退路径 用户讨论:GLOBAL/{页面名}/analytics_{站点名}.json（原始分片，仅无汇总页时扫描）
+ *
+ * 每条记录字段：uid / time / ua / page / wikiid
+ *
+ * 报表维度：
+ *   - 总览卡片：总访问数、独立访客数（去重 UID）、被统计页面数
+ *   - 页面访问量 Top 榜
+ *   - 用户活跃度 Top 榜 + 明细（每用户访问次数 / 访问页面数 / 最新时间）
+ *   - 按天访问趋势（柱状图）
+ *   - 「查看全部访问记录」折叠面板：列出全部原始记录，支持按 UID / 时间范围 / 页面关键字筛选
+ *     （数据源为原始分片扫描，首次展开时加载并缓存，之后筛选即时响应）
+ *
+ * 运行方式：作为 Gadget 或挂到 MediaWiki:Common.js，在「全站访问统计」页面（或任意含
+ * <div id="stats-viewer"></div> 的页面）自动渲染。依赖 NGBASE（MediaWiki:Api.js）、
+ * jQuery 与 mw（MediaWiki 自带，不要另引 CDN）。
+ */
+(function (global) {
+    'use strict';
+
+    // ==================== 配置 ====================
+    var DEFAULT_STATS_PAGE = '全站访问统计'; // 未显式放容器时自动挂载的页面名
+    var CONCURRENCY = 6;                     // 读分片/读页面内部并发（已被全局节流序列化，见 throttled）
+    var PAGE_SIZE = 500;                      // 与 analytics.js 保持一致
+    var MAX_USER_ROWS = 100;                  // 用户明细表最多展示行数
+    var MAX_DAY_BARS = 60;                    // 趋势图最多展示天数
+    var MAX_RECORD_ROWS = 500;                // 记录明细表最多展示行数（性能上限）
+    var REQUEST_DELAY = 300;                  // 相邻读取请求最小间隔(ms)：B站 wiki 567 限流，50ms 太密必被拦，300ms≈3.3/s 较安全
+    // 权限门禁：仅以下用户组的成员才加载并展示全站统计
+    //   'bureaucrat' = 行政员，'sysop' = 管理员（取 mw.config.values.wgUserGroups）
+    var ALLOWED_GROUPS = ['bureaucrat', 'sysop'];
+
+    // ==================== 纯聚合层（可独立测试） ====================
+
+    function pad2(n) { return n < 10 ? '0' + n : '' + n; }
+
+    function dayOf(ts) {
+        var d = new Date(ts);
+        if (isNaN(d.getTime())) return '';
+        return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+    }
+
+    function fmtTime(ts) {
+        if (!ts) return '-';
+        var d = new Date(ts);
+        if (isNaN(d.getTime())) return '-';
+        return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) +
+            ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+    }
+
+    /**
+     * pages: [{ title, count, logs: [rec,...] }]
+     * 返回聚合结果对象
+     */
+    function aggregate(pages) {
+        pages = pages || [];
+        var total = 0;
+        var uidSet = Object.create(null);
+        var userMap = Object.create(null);
+        var pageMap = Object.create(null);
+        var dayMap = Object.create(null);
+
+        for (var i = 0; i < pages.length; i++) {
+            var p = pages[i] || {};
+            var pc = (typeof p.count === 'number' && p.count >= 0) ? p.count : 0;
+            var title = p.title || '';
+            pageMap[title] = (pageMap[title] || 0) + pc;
+            total += pc;
+
+            var logs = Array.isArray(p.logs) ? p.logs : [];
+            for (var j = 0; j < logs.length; j++) {
+                var r = logs[j];
+                if (!r) continue;
+                var uid = (r.uid != null) ? String(r.uid) : '';
+                if (uid) {
+                    uidSet[uid] = true;
+                    var u = userMap[uid];
+                    if (!u) u = userMap[uid] = { uid: uid, count: 0, pages: Object.create(null), lastTime: 0 };
+                    u.count++;
+                    if (title) u.pages[title] = (u.pages[title] || 0) + 1;
+                    if (r.time && r.time > u.lastTime) u.lastTime = r.time;
+                }
+                if (r.time) {
+                    var day = dayOf(r.time);
+                    if (day) dayMap[day] = (dayMap[day] || 0) + 1;
+                }
+            }
+        }
+
+        var byPage = Object.keys(pageMap)
+            .map(function (t) { return { title: t, count: pageMap[t] }; })
+            .sort(function (a, b) { return b.count - a.count; });
+
+        var byUser = Object.keys(userMap)
+            .map(function (uid) {
+                var u = userMap[uid];
+                return { uid: uid, count: u.count, pageCount: Object.keys(u.pages).length, pages: u.pages, lastTime: u.lastTime };
+            })
+            .sort(function (a, b) { return b.count - a.count; });
+
+        var byDay = Object.keys(dayMap)
+            .map(function (d) { return { day: d, count: dayMap[d] }; })
+            .sort(function (a, b) { return a.day < b.day ? -1 : 1; });
+
+        return {
+            total: total,
+            uniqueUsers: Object.keys(uidSet).length,
+            pageCount: byPage.length,
+            byPage: byPage,
+            byUser: byUser,
+            byDay: byDay
+        };
+    }
+
+    /**
+     * 从「汇总页」结构直接聚合（无需读原始分片）：
+     *   sum = { total, uniqueUsers, days:{日期:次数}, pages:{标题:次数}, users:{uid:{c,t}} }
+     * 返回与 aggregate() 同形状的 agg，供 render() 复用。
+     * 注意：汇总模式不记录每用户访问了哪些页面，故 pageCount 记为 0（报表中以「-」展示）。
+     */
+    function aggregateSummary(sum) {
+        sum = sum || {};
+        var total = sum.total || 0;
+        var uniqueUsers = sum.uniqueUsers || 0;
+        var pageMap = sum.pages || {};
+        var dayMap = sum.days || {};
+        var users = sum.users || {};
+
+        var byPage = Object.keys(pageMap)
+            .map(function (t) { return { title: t, count: pageMap[t] }; })
+            .sort(function (a, b) { return b.count - a.count; });
+
+        var byUser = Object.keys(users)
+            .map(function (uid) {
+                var u = users[uid];
+                var c = (u && typeof u === 'object') ? u.c : u;
+                var t = (u && typeof u === 'object') ? u.t : 0;
+                return { uid: uid, count: c || 0, pageCount: 0, lastTime: t || 0 };
+            })
+            .sort(function (a, b) { return b.count - a.count; });
+
+        var byDay = Object.keys(dayMap)
+            .map(function (d) { return { day: d, count: dayMap[d] }; })
+            .sort(function (a, b) { return a.day < b.day ? -1 : 1; });
+
+        return {
+            total: total,
+            uniqueUsers: uniqueUsers,
+            pageCount: byPage.length,
+            byPage: byPage,
+            byUser: byUser,
+            byDay: byDay
+        };
+    }
+
+    /**
+     * 从 V2 轻量汇总（已合并各维度分表）直接聚合，产出与 aggregate() 同形状的 agg，
+     * 并附带 devices / systems / browsers 分布（饼图用）与 actions 行为维度（行为面板用）。
+     * 全部来自维度分表，无需扫描原始分片——实现「秒开」。
+     */
+    function aggregateSummaryV2(m) {
+        m = m || {};
+        var total = m.total || 0;
+        var uniqueUsers = m.uniqueUsers || 0;
+        var pageMap = m.pages || {};
+        var dayMap = m.days || {};
+        var users = m.users || {};
+        var dev = m.devices || {};
+        var sys = m.systems || {};
+        var br = m.browsers || {};
+        var aud = m.audience || {};
+        var actions = m.actions || {};
+
+        var byPage = Object.keys(pageMap).map(function (t) { return { title: t, count: pageMap[t] }; }).sort(function (a, b) { return b.count - a.count; });
+        var byUser = Object.keys(users).map(function (uid) {
+            var u = users[uid];
+            var c = (u && typeof u === 'object') ? u.c : u;
+            var t = (u && typeof u === 'object') ? u.t : 0;
+            return { uid: uid, count: c || 0, pageCount: 0, lastTime: t || 0 };
+        }).sort(function (a, b) { return b.count - a.count; });
+        var byDay = Object.keys(dayMap).map(function (d) { return { day: d, count: dayMap[d] }; }).sort(function (a, b) { return a.day < b.day ? -1 : 1; });
+
+        function toDist(map) {
+            var items = Object.keys(map).map(function (k) { return { key: k, count: map[k] }; }).sort(function (a, b) { return b.count - a.count; });
+            var tt = 0; for (var i = 0; i < items.length; i++) tt += items[i].count;
+            return { items: items, total: tt };
+        }
+
+        // 行为：跨日期合计每个 action
+        var actTotal = {};
+        var actDates = Object.keys(actions);
+        for (var di = 0; di < actDates.length; di++) {
+            var sub = actions[actDates[di]] || {};
+            for (var a in sub) if (sub.hasOwnProperty(a)) actTotal[a] = (actTotal[a] || 0) + sub[a];
+        }
+
+        // 受众分析（下限）：从每 UID 去重的环境集合现场算「使用某环境的独立用户数」。
+        // 分母用 uniqueUsers（全部登录用户），故百分比之和可能 >100%（一人可多设备）。
+        var audDev = {}, audOs = {}, audBr = {};
+        for (var au in aud) if (aud.hasOwnProperty(au)) {
+            var e = aud[au] || {};
+            (e.devs || []).forEach(function (k) { if (k) audDev[k] = (audDev[k] || 0) + 1; });
+            (e.oss || []).forEach(function (k) { if (k) audOs[k] = (audOs[k] || 0) + 1; });
+            (e.brs || []).forEach(function (k) { if (k) audBr[k] = (audBr[k] || 0) + 1; });
+        }
+        function toAudDist(map) {
+            return Object.keys(map).map(function (k) { return { key: k, count: map[k] }; }).sort(function (a, b) { return b.count - a.count; });
+        }
+        var audienceDevices = { items: toAudDist(audDev), total: uniqueUsers };
+        var audienceSystems = { items: toAudDist(audOs), total: uniqueUsers };
+        var audienceBrowsers = { items: toAudDist(audBr), total: uniqueUsers };
+
+        return {
+            total: total, uniqueUsers: uniqueUsers, pageCount: byPage.length,
+            byPage: byPage, byUser: byUser, byDay: byDay,
+            devices: toDist(dev), systems: toDist(sys), browsers: toDist(br),
+            audienceDevices: audienceDevices, audienceSystems: audienceSystems, audienceBrowsers: audienceBrowsers,
+            actionsByDay: actions, actionsTotal: actTotal
+        };
+    }
+
+
+    /**
+     * 回头率分析：输入 agg.byUser（含每用户 count），输出回访指标。
+     * 定义：回头用户 = 访问≥2次；回头率 = 回头用户 / 总独立用户。
+     * 汇总模式与原始模式都适用（两者都带每用户 count）。
+     */
+    function returnStats(byUser) {
+        byUser = byUser || [];
+        var total = byUser.length;
+        var returning = 0, oneTime = 0, visitsReturning = 0;
+        for (var i = 0; i < byUser.length; i++) {
+            var c = byUser[i].count || 0;
+            if (c >= 2) { returning++; visitsReturning += c; }
+            else if (c === 1) { oneTime++; }
+        }
+        return {
+            total: total,
+            returningUsers: returning,
+            oneTimeUsers: oneTime,
+            returnRate: total > 0 ? returning / total : 0,
+            avgVisitsReturning: returning > 0 ? visitsReturning / returning : 0
+        };
+    }
+
+    /**
+     * 把时间戳按粒度归并成桶 key。
+     *   unit = 'day'   -> 'YYYY-MM-DD'
+     *   unit = 'month' -> 'YYYY-MM'
+     *   unit = 'year'  -> 'YYYY'
+     */
+    function timeUnitKey(ts, unit) {
+        var d = new Date(ts);
+        if (isNaN(d.getTime())) return '';
+        var y = d.getFullYear();
+        if (unit === 'year') return '' + y;
+        var m = pad2(d.getMonth() + 1);
+        if (unit === 'month') return y + '-' + m;
+        return y + '-' + m + '-' + pad2(d.getDate());
+    }
+
+    /**
+     * 按时间粒度对原始记录做「页面访问量」聚合。
+     * records: [{ _page, time, ... }]（flattenRecords 的输出）
+     * 返回 { buckets: [{ key, count, byPage:[{title,count}] }] }，buckets 按 key 倒序（最新在前）。
+     * 注意：每个桶的 count 是该时段的访问总数，byPage 占比以该桶 count 为分母（而非全局）。
+     */
+    function aggregatePagesByTime(records, unit, topN) {
+        records = records || [];
+        topN = topN || 50;
+        var map = Object.create(null);
+        for (var i = 0; i < records.length; i++) {
+            var r = records[i];
+            if (!r || !r.time) continue;
+            var key = timeUnitKey(r.time, unit);
+            if (!key) continue;
+            var b = map[key];
+            if (!b) b = map[key] = { key: key, count: 0, pages: Object.create(null) };
+            b.count++;
+            var title = r._page || '';
+            b.pages[title] = (b.pages[title] || 0) + 1;
+        }
+        var keys = Object.keys(map).sort(function (a, b) { return a < b ? 1 : -1; });
+        return {
+            buckets: keys.map(function (k) {
+                var b = map[k];
+                var byPage = Object.keys(b.pages)
+                    .map(function (t) { return { title: t, count: b.pages[t] }; })
+                    .sort(function (a, b) { return b.count - a.count; });
+                return { key: k, count: b.count, byPage: byPage };
+            })
+        };
+    }
+
+    /**
+     * 把「按页面聚合的分片数据」拍平成单条记录数组，供明细筛选使用。
+     * pages: [{ title, count, logs:[rec,...] }]
+     * 返回：[{ uid, time, ua, page, wikiid, _page }]，_page = 所属 wiki 页面标题
+     */
+    function flattenRecords(pages) {
+        pages = pages || [];
+        var out = [];
+        for (var i = 0; i < pages.length; i++) {
+            var p = pages[i] || {};
+            var title = p.title || '';
+            var logs = Array.isArray(p.logs) ? p.logs : [];
+            for (var j = 0; j < logs.length; j++) {
+                var r = logs[j];
+                if (!r) continue;
+                out.push({
+                    uid: (r.uid != null) ? String(r.uid) : '',
+                    time: r.time || 0,
+                    ua: r.ua || '',
+                    page: r.page || '',
+                    wikiid: (r.wikiid != null) ? String(r.wikiid) : '',
+                    _page: title
+                });
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 按条件筛选记录（纯函数，浏览器 / 测试共用）。
+     * criteria: { uid?, timeFrom?, timeTo?, page?, os?, form?, browser? }
+     *   uid     : 字符串，包含匹配（支持部分 UID）
+     *   timeFrom: 起始时间戳（含，>=）
+     *   timeTo  : 结束时间戳（含，<=）
+     *   page    : 页面关键字，匹配 _page 或 page(URL)，包含匹配
+     *   os/form/browser : 系统/设备类型/浏览器 的【精确匹配】（来自下拉菜单），由 UA 解析得出
+     */
+    function filterRecords(records, criteria) {
+        records = records || [];
+        criteria = criteria || {};
+        var uid = (criteria.uid != null ? String(criteria.uid) : '').trim();
+        var from = (typeof criteria.timeFrom === 'number' && !isNaN(criteria.timeFrom)) ? criteria.timeFrom : null;
+        var to = (typeof criteria.timeTo === 'number' && !isNaN(criteria.timeTo)) ? criteria.timeTo : null;
+        var page = (criteria.page != null ? String(criteria.page) : '').trim().toLowerCase();
+        var os = (criteria.os != null ? String(criteria.os) : '').trim();
+        var form = (criteria.form != null ? String(criteria.form) : '').trim();
+        var browser = (criteria.browser != null ? String(criteria.browser) : '').trim();
+        var res = [];
+        for (var i = 0; i < records.length; i++) {
+            var r = records[i];
+            if (uid && (r.uid == null || r.uid.indexOf(uid) < 0)) continue;
+            if (from != null && r.time < from) continue;
+            if (to != null && r.time > to) continue;
+            if (page && (r._page || '').toLowerCase().indexOf(page) < 0 && (r.page || '').toLowerCase().indexOf(page) < 0) continue;
+            if (os && parseOS(r.ua) !== os) continue;
+            if (form && parseForm(r.ua) !== form) continue;
+            if (browser && parseBrowser(r.ua) !== browser) continue;
+            res.push(r);
+        }
+        return res;
+    }
+
+    /**
+     * 排序（默认按 time 倒序，最新在前）。返回新数组，不修改入参。
+     */
+    function sortRecords(records, opts) {
+        opts = opts || {};
+        var dir = opts.dir === 'asc' ? 1 : -1;
+        var key = opts.key || 'time';
+        var arr = (records || []).slice();
+        arr.sort(function (a, b) {
+            var av, bv;
+            if (key === 'time') { av = a.time || 0; bv = b.time || 0; }
+            else if (key === 'uid') { av = a.uid || ''; bv = b.uid || ''; }
+            else { av = a[key] || ''; bv = b[key] || ''; }
+            if (av < bv) return -1 * dir;
+            if (av > bv) return 1 * dir;
+            return 0;
+        });
+        return arr;
+    }
+
+    // ==================== UA 解析层（读取端浏览器/设备识别） ====================
+    // 说明：analytics.js 写入时只存了原始 navigator.userAgent 字符串（ua 字段），
+    // 一切「系统 / 设备类型 / 浏览器 / 内核」都是读取端从 ua 反推的。识别靠关键词匹配，
+    // 不是「知道」而是「猜」——UA 可被伪造，仅作统计参考。
+    // 关键顺序铁律（务必遵守，否则误判）：
+    //   1) 鸿蒙(HarmonyOS/OpenHarmony) 必须在 Android 之前判 —— 鸿蒙4.2 的 UA 同时含 Android+HarmonyOS
+    //   2) 厂商/App 专属 token（HuaweiBrowser/ArkWeb/Edg/CriOS/BiliApp/MicroMessenger…）必须在 Chrome/Safari 之前判
+    //      —— 几乎所有国产浏览器/App 内 WebView 都是 Chromium 内核，UA 里都带 Chrome/Safari，先判它们会全变 Chrome
+
+    function parseOS(ua) {
+        ua = ua || '';
+        if (/OpenHarmony|HarmonyOS/i.test(ua)) return 'HarmonyOS';
+        if (/CPU iPhone OS|iPhone|iPad/i.test(ua)) return 'iOS';
+        if (/Android/i.test(ua)) return 'Android';
+        if (/Mac OS X|Macintosh/i.test(ua)) return 'macOS';
+        if (/Windows NT/i.test(ua)) return 'Windows';
+        if (/Linux/i.test(ua)) return 'Linux';
+        return '其他';
+    }
+
+    function parseForm(ua) {
+        ua = ua || '';
+        if (/Tablet/i.test(ua)) return '平板';
+        if (/Phone|Mobile|iPad|iPhone/i.test(ua)) return '手机';
+        if (/Macintosh|Windows NT|Linux/i.test(ua)) return '桌面';
+        return '其他';
+    }
+
+    function parseBrowser(ua) {
+        ua = ua || '';
+        // —— 下列 App / 厂商专属 token 全部排在 Chrome/Safari 之前 ——
+        if (/MicroMessenger/i.test(ua)) return '微信';
+        if (/QQBrowser|MQQBrowser/i.test(ua)) return 'QQ浏览器';
+        if (/baiduboxapp|baidubox/i.test(ua)) return '百度APP';
+        if (/Quark/i.test(ua)) return '夸克';
+        if (/AlipayClient/i.test(ua)) return '支付宝';
+        if (/AliApp\(TB/i.test(ua)) return '淘宝';
+        if (/AliApp\(DingTalk/i.test(ua)) return '钉钉';
+        if (/Aweme/i.test(ua)) return '抖音';
+        if (/NewsArticle/i.test(ua)) return '今日头条';
+        if (/MiuiBrowser|XiaoMi/i.test(ua)) return '小米浏览器';
+        if (/HuaweiBrowser|ArkWeb|HBPC/i.test(ua)) return '华为浏览器';
+        if (/HeyTapBrowser/i.test(ua)) return 'OPPO浏览器';
+        if (/VivoBrowser|BBKBrowser/i.test(ua)) return 'vivo浏览器';
+        if (/SamsungBrowser/i.test(ua)) return '三星浏览器';
+        if (/MZBrowser|Flyme/i.test(ua)) return '魅族浏览器';
+        if (/BiliApp/i.test(ua)) return '哔哩哔哩';
+        // —— 通用浏览器（仍在 Chrome/Safari 之前） ——
+        if (/Edg/i.test(ua)) return 'Edge';
+        if (/CriOS/i.test(ua)) return 'iOS Chrome';
+        if (/QihooBrowser|360SE|360EE/i.test(ua)) return '360浏览器';
+        if (/Sogou|MetaSr/i.test(ua)) return '搜狗浏览器';
+        if (/Firefox/i.test(ua)) return 'Firefox';
+        // —— 兜底：Chromium / WebKit 内核通用 ——
+        if (/Chrome/i.test(ua)) return 'Chrome';
+        if (/Safari/i.test(ua)) return 'Safari';
+        if (/MSIE|Trident/i.test(ua)) return 'IE';
+        return '其他';
+    }
+
+    // 内核与版本：返回 { engine, ver(大版本号或null) }
+    // 注意：UA 里的 Chrome/<ver> 是「Chromium 渲染内核版本」，被 Edge/华为/百度/夸克/360/微信·QQ WebView
+    //       等一众浏览器共用，不代表「Google Chrome 版本」；iOS 走 WebKit(Version/)，无 Chromium 版本。
+    function parseEngine(ua) {
+        ua = ua || '';
+        var m;
+        if ((m = ua.match(/Chrome\/(\d+)/))) return { engine: 'Chromium', ver: +m[1] };
+        if ((m = ua.match(/CriOS\/(\d+)/))) return { engine: 'Chromium', ver: +m[1] };
+        if ((m = ua.match(/Firefox\/(\d+)/))) return { engine: 'Gecko', ver: +m[1] };
+        if ((m = ua.match(/Version\/(\d+)/))) return { engine: 'WebKit', ver: +m[1] };
+        if (/Trident/i.test(ua)) { var mm = ua.match(/rv:(\d+)/); return { engine: 'Trident', ver: mm ? +mm[1] : null }; }
+        return { engine: '未知', ver: null };
+    }
+
+    // 一次性解析（供表格/筛选复用）
+    function parseUA(ua) {
+        var eng = parseEngine(ua);
+        return {
+            os: parseOS(ua),
+            form: parseForm(ua),
+            browser: parseBrowser(ua),
+            engine: eng.engine,
+            engineVer: eng.ver
+        };
+    }
+
+    // 从记录数组按某个解析维度做分布聚合：返回 [{ key, count }]（按 count 降序）
+    function distribute(records, accessor) {
+        records = records || [];
+        var map = Object.create(null);
+        var total = 0;
+        for (var i = 0; i < records.length; i++) {
+            var k = accessor(records[i]);
+            if (!k) continue;
+            map[k] = (map[k] || 0) + 1;
+            total++;
+        }
+        var arr = Object.keys(map).map(function (k) { return { key: k, count: map[k] }; });
+        arr.sort(function (a, b) { return b.count - a.count; });
+        return { items: arr, total: total };
+    }
+
+    // ---- 并发限制（纯逻辑，浏览器层与测试共用） ----
+    function mapLimit(list, limit, fn) {
+        var out = new Array(list.length), cursor = 0;
+        function worker() {
+            if (cursor >= list.length) return Promise.resolve();
+            var i = cursor++;
+            return Promise.resolve(fn(list[i], i)).then(function (r) {
+                out[i] = r;
+                return worker();
+            });
+        }
+        var pool = [], n = Math.min(limit, list.length);
+        for (var i = 0; i < n; i++) pool.push(worker());
+        return Promise.all(pool).then(function () { return out; });
+    }
+
+    // ---- 全局请求节流：保证相邻读取请求至少间隔 REQUEST_DELAY ms ----
+    // 目的：扫描大量分片时（几百~上千个页面）不会瞬间把请求轰到 data wiki。
+    // 实现：用一个 Promise 链把所有请求串起来，每个请求开始前先 sleep 补足间隔。
+    function sleep(ms) {
+        return new Promise(function (res) { setTimeout(res, ms); });
+    }
+    var _thrChain = Promise.resolve();
+    var _thrLast = 0;
+    function throttled(taskFn) {
+        var scheduled = _thrChain.then(function () {
+            var wait = Math.max(0, REQUEST_DELAY - (Date.now() - _thrLast));
+            return sleep(wait);
+        });
+        var run = scheduled.then(function () {
+            _thrLast = Date.now();
+            return taskFn();
+        });
+        // 防止某个请求的 reject 中断整条链
+        _thrChain = run.then(function () {}, function () {});
+        return run;
+    }
+    // 把任意 nb 对象包一层，使其 read/save 全部走节流
+    // 注意：必须透传 opt（含 pwd），否则加密参数在节流层被吞掉 → V2 明文落库
+    function withThrottle(nb) {
+        if (!REQUEST_DELAY || REQUEST_DELAY <= 0) return nb;
+        return {
+            read: function (k, opt) { return throttled(function () { return nb.read(k, opt); }); },
+            save: function (k, d, opt) { return throttled(function () { return nb.save(k, d, opt); }); }
+        };
+    }
+
+    // 读取带退避重试：应对 data wiki 的 567 限流/瞬时拒读。
+    // 关键：读取失败绝不能直接吞掉（否则 1577 页全空 → 聚合为 0 → 误清空 V2）。
+    function readWithRetry(nb, key, opt, tries) {
+        tries = tries || 8;
+        function attempt(n) {
+            return nb.read(key, opt).catch(function (e) {
+                if (n <= 1) {
+                    if (typeof window !== 'undefined' && window.console)
+                        console.warn('[stats-viewer] 读 ' + key + ' 最终失败（已重试 ' + (tries - 1) + ' 次）', e && (e.code || e.httpStatus || e.message || ''));
+                    return Promise.reject(e);
+                }
+                var backoff = Math.min(10000, 500 * Math.pow(2, tries - n)); // 500/1000/2000/4000/8000/10000ms
+                return sleep(backoff).then(function () { return attempt(n - 1); });
+            });
+        }
+        return attempt(tries);
+    }
+
+    // 页面标题变体：wgTitle(空格) 与 wgPageName(下划线) 可能不一致，两种都试
+    function keyVariants(title) {
+        var swapped = title.indexOf(' ') >= 0 ? title.replace(/ /g, '_') : title.replace(/_/g, ' ');
+        var out = [title];
+        if (swapped !== title) out.push(swapped);
+        return out;
+    }
+
+    // ---- 原始分片扫描用的正则：排除汇总页 analytics_summary_* ----
+    function rawPageRegex(site) {
+        // 注意：负向先行必须用 (?!...) 而非 (?! (...) )，否则内层括号会变成多余捕获组，
+        // 导致 m[3] 变成分片号、m[4] 才是站点，与下方 m[3] !== site 的判定错位。
+        return /^用户讨论:GLOBAL\/(.*)\/analytics[ _](?!summary[ _])(?:(\d+)[ _])?([^.\/]+?)\.json$/;
+    }
+
+    // ---- 直接读汇总页（主路径，无需扫描分片） ----
+    function readSummary(nb, site) {
+        return readWithRetry(nb, 'analytics_summary_' + site).then(function (idx) {
+            if (!idx) return null;
+            if (idx.usersShards && idx.usersShards > 0) {
+                var ns = [];
+                for (var i = 0; i < idx.usersShards; i++) ns.push(i);
+                return mapLimit(ns, CONCURRENCY, function (n) {
+                    return nb.read('analytics_summary_users_' + n + '_' + site)
+                        .then(function (d) { return (d && d.users) || {}; })
+                        .catch(function () { return {}; });
+                }).then(function (shards) {
+                    var users = {};
+                    for (var k = 0; k < shards.length; k++) {
+                        var u = shards[k];
+                        for (var uid in u) if (u.hasOwnProperty(uid)) users[uid] = u[uid];
+                    }
+                    return { total: idx.total || 0, uniqueUsers: idx.uniqueUsers || 0, days: idx.days || {}, pages: idx.pages || {}, users: users };
+                });
+            }
+            return { total: idx.total || 0, uniqueUsers: idx.uniqueUsers || 0, days: idx.days || {}, pages: idx.pages || {}, users: idx.users || {} };
+        }).catch(function () { return null; });
+    }
+
+    // ---- 直接读 V2 轻量汇总（优先于 v1）：读索引 + 各维度分表合并 ----
+    // 返回 { schema:2, password, total, uniqueUsers, days, pages, users, devices, systems, browsers, actions }
+    // 取 V2 加密密码（来自 analytics.js 暴露的 AnalyticsStore._v2.V2_PASSWORD）；
+    // 若 AnalyticsStore 未加载则降级为 {}（读取不加密的数据），不阻断
+    function v2PwdOpt() {
+        try {
+            if (typeof AnalyticsStore !== 'undefined' && AnalyticsStore._v2 && AnalyticsStore._v2.V2_PASSWORD) {
+                return { pwd: AnalyticsStore._v2.V2_PASSWORD };
+            }
+        } catch (e) {}
+        return {};
+    }
+    // 读 V2 汇总：索引 + 各维度分表均按 pwd 加密，read 必须带相同 pwd 才能解密
+    function readSummaryV2(nb, site) {
+        var opt = v2PwdOpt();
+        return nb.read('analytics_summary_v2_' + site, opt).then(function (idx) {
+            if (!idx || idx.schema !== 2) return null;
+            var buckets = idx.buckets || {};
+            var dims = ['users', 'pages', 'days', 'devices', 'systems', 'browsers', 'actions', 'audience'];
+            return Promise.all(dims.map(function (dim) {
+                var b = buckets[dim] || { shards: 0, total: 0 };
+                var ns = [];
+                for (var i = 0; i < (b.shards || 0); i++) ns.push(i);
+                if (!ns.length) return Promise.resolve({});
+                return mapLimit(ns, CONCURRENCY, function (n) {
+                    return nb.read('analytics_v2_' + dim + '_' + n + '_' + site, opt)
+                        .then(function (d) { return d ? (d[dim] || {}) : {}; })
+                        .catch(function () { return {}; });
+                }).then(function (shards) {
+                    var merged = {};
+                    for (var k = 0; k < shards.length; k++) {
+                        var m = shards[k];
+                        for (var key in m) if (m.hasOwnProperty(key)) merged[key] = m[key];
+                    }
+                    return merged;
+                });
+            })).then(function (res) {
+                return {
+                    schema: 2, password: idx.password, total: idx.total || 0, uniqueUsers: idx.uniqueUsers || 0,
+                    days: res[2] || {}, pages: res[1] || {}, users: res[0] || {},
+                    devices: res[3] || {}, systems: res[4] || {}, browsers: res[5] || {}, actions: res[6] || {},
+                    audience: res[7] || {}
+                };
+            });
+        }).catch(function () { return null; });
+    }
+
+    // 安全日志（纯逻辑层在 node 测试下 window 不存在）
+    function logInfo(msg) {
+        try { if (typeof window !== 'undefined' && window.console && window.console.info) window.console.info(msg); } catch (e) {}
+    }
+
+    // ---- 读取所有原始分片并拍平为单条记录（明细浏览器数据源） ----
+    // 设计：优先从【汇总页】拿到「所有有数据的页面标题」(sum.pages 的 key 即为 wgTitle)，
+    //       据此直接构造页面索引 key（用户讨论:GLOBAL/{页面名}），再逐层读取
+    //       「页面索引 -> 分片」，绝不全量扫描 GLOBAL/ 前缀（那会把点赞/阅读/统计所有页列出来）。
+    //       仅当汇总页不存在（过渡期 / backfill 未跑）才回退 data wiki 全量扫描。
+    function loadAllRecords(nb, site, onProgress) {
+        return readSummary(nb, site).then(function (sum) {
+            var titles;
+            if (sum && sum.pages && Object.keys(sum.pages).length) {
+                logInfo('[stats-viewer] 明细模式：汇总页已知 ' + Object.keys(sum.pages).length + ' 个页面，逐层读取原始分片（跳过全量扫描）');
+                // 注意：sum.pages 的 key 已是【裸页面标题】(wgTitle)，fetchPage 内部会经 nb.read
+                // 自动拼接 用户讨论:GLOBAL/ 前缀，这里【绝不能】再自己拼一次，否则会变成双重前缀 404。
+                titles = Object.keys(sum.pages);
+            } else {
+                logInfo('[stats-viewer] 明细模式：未找到汇总页，回退 data wiki 全量扫描（建议先执行 StatsViewer.backfill()）');
+                return apiListPages('GLOBAL/').then(function (allTitles) {
+                    var RE = rawPageRegex(site);
+                    var set = Object.create(null);
+                    for (var i = 0; i < allTitles.length; i++) {
+                        var m = RE.exec(allTitles[i]);
+                        if (!m || m[3] !== site) continue;
+                        set[m[1]] = true; // m[1] = 裸页面标题
+                    }
+                    return scanTitles(Object.keys(set), nb, site, onProgress); // 裸标题，交给 fetchPage 拼前缀
+                });
+            }
+            return scanTitles(titles, nb, site, onProgress);
+        });
+    }
+
+    // 逐页读取并拍平；onProgress(done, total) 在每完成一个页面时回调，供进度条使用
+    // 分批扫描：每批 CHUNK 个页面，批间喘息，避免对 data wiki 持续高压触发 567 限流
+    function scanTitles(titles, nb, site, onProgress) {
+        var done = 0, total = titles.length;
+        if (onProgress) onProgress(0, total);
+        var CHUNK = 250;
+        var i = 0;
+        function nextChunk() {
+            if (i >= titles.length) return Promise.resolve([]);
+            var chunk = titles.slice(i, i + CHUNK);
+            i += CHUNK;
+            return mapLimit(chunk, CONCURRENCY, function (title) {
+                return fetchPage(nb, title, site).then(function (r) {
+                    done++;
+                    if (onProgress) onProgress(done, total);
+                    return r;
+                });
+            }).then(function (pages) {
+                return sleep(2000).then(function () {
+                    return nextChunk().then(function (rest) { return pages.concat(rest); });
+                });
+            });
+        }
+        return nextChunk().then(function (pages) {
+            return flattenRecords(pages.filter(Boolean));
+        });
+    }
+
+    var StatsViewer = {
+        aggregate: aggregate,
+        aggregateSummary: aggregateSummary,
+        aggregateSummaryV2: aggregateSummaryV2,
+        readSummaryV2: readSummaryV2,
+        returnStats: returnStats,
+        timeUnitKey: timeUnitKey,
+        aggregatePagesByTime: aggregatePagesByTime,
+        flattenRecords: flattenRecords,
+        filterRecords: filterRecords,
+        sortRecords: sortRecords,
+        parseOS: parseOS,
+        parseForm: parseForm,
+        parseBrowser: parseBrowser,
+        parseEngine: parseEngine,
+        parseUA: parseUA,
+        distribute: distribute,
+        dayOf: dayOf,
+        fmtTime: fmtTime,
+        PAGE_SIZE: PAGE_SIZE,
+        MAX_USER_ROWS: MAX_USER_ROWS,
+        MAX_DAY_BARS: MAX_DAY_BARS,
+        MAX_RECORD_ROWS: MAX_RECORD_ROWS,
+        _rawPageRegex: rawPageRegex,
+        _readSummary: readSummary,
+        _mapLimit: mapLimit,
+        _loadAllRecords: loadAllRecords,
+        _dataApiBase: dataApiBase,
+        _withThrottle: withThrottle,
+        _throttled: throttled,
+        _sleep: sleep,
+        REQUEST_DELAY: REQUEST_DELAY,
+        ALLOWED_GROUPS: ALLOWED_GROUPS,
+        _pageTopAllHtml: pageTopAllHtml,
+        _pageTopTimeHtml: pageTopTimeHtml
+    };
+
+    global.StatsViewer = StatsViewer;
+    if (typeof module === 'object' && module.exports) module.exports = StatsViewer;
+
+    // ==================== 浏览器绑定层 ====================
+    if (typeof window === 'undefined' || typeof document === 'undefined') return;
+
+    var booted = false;
+    var _explorerState = { records: null, loading: false, _promise: null }; // 明细浏览器 + 时间维度页面Top：首次加载后缓存全部记录
+    var _pageTop = { agg: null, selected: null }; // 时间维度页面Top：selected = { day:key, month:key, year:key }
+
+    // ---- 错误描述：把 jQuery/fetch 等各种错误对象转成可读文本 ----
+    function describeError(e) {
+        if (!e) return '未知错误';
+        if (typeof e === 'string') return e;
+        if (e.info) return (e.code ? e.code + ': ' : '') + e.info;
+        if (e.httpStatus) return 'HTTP ' + e.httpStatus + (e.httpText ? ' — ' + e.httpText : '');
+        if (e.statusText) return 'HTTP ' + e.status + ' ' + e.statusText;
+        try { return JSON.stringify(e); } catch (x) { return String(e); }
+    }
+
+    // 数据页（用户讨论:GLOBAL/...）实际存储在「data wiki」(wiki.biligame.com/data/)，
+    // 与当前游戏 wiki(seer) 仅路径不同、同 host，因此：
+    //   - 不能用 mw.util.wikiScript('api')（它指向【当前 wiki】，列不到 data wiki 的数据页）
+    //   - 须改为请求 data wiki 的 api.php（同 host → 浏览器端 same-origin，且 Referer 自动带 seer 页地址，可绕过 567）
+    // NGBASE 脚本即来自 data wiki，从其 <script src> 解析出 data wiki 的 api 地址最稳，不写死。
+    function dataApiBase() {
+        try {
+            var scripts = document.scripts || [];
+            for (var i = 0; i < scripts.length; i++) {
+                var src = (scripts[i].getAttribute && scripts[i].getAttribute('src')) || '';
+                if (src && src.indexOf('MediaWiki:Api.js') >= 0) {
+                    var u = new URL(src, location.href);
+                    var segs = u.pathname.split('/');
+                    segs.pop(); // 去掉末段 index.php
+                    return u.origin + segs.join('/') + '/api.php';
+                }
+            }
+        } catch (e) {}
+        // fallback：同 host 下的 /data/api.php（已知部署结构）
+        return location.protocol + '//' + location.host + '/data/api.php';
+    }
+
+    // ---- MediaWiki API 列出 GLOBAL 下所有子页面 ----
+    function apiListPages(prefix) {
+        var out = [];
+        // 「用户讨论」命名空间 = User talk（B站 wiki 实测 ID=3）；优先取前端注入的 ID，fallback 3
+        var nsId = 3;
+        try {
+            var nids = (mw.config.values && mw.config.values.wgNamespaceIds) || {};
+            if (nids['用户讨论'] != null) nsId = nids['用户讨论'];
+            else if (nids['User_talk'] != null) nsId = nids['User_talk'];
+        } catch (e) {}
+        function apiUrl() {
+            return dataApiBase();
+        }
+        function next(cont) {
+            var qs = 'action=query&format=json&formatversion=2&list=allpages' +
+                '&apnamespace=' + encodeURIComponent(nsId) +
+                '&apprefix=' + encodeURIComponent(prefix) + '&aplimit=500';
+            if (cont) qs += '&apcontinue=' + encodeURIComponent(cont);
+            var base = apiUrl();
+            var sep = base.indexOf('?') >= 0 ? '&' : '?';
+            if (typeof window !== 'undefined' && window.console) console.info('[stats-viewer] 请求 allpages（data wiki）：' + base + '  ns=' + nsId + ' prefix=' + prefix);
+            return sleep(REQUEST_DELAY).then(function () {
+                return fetch(base + sep + qs, { credentials: 'include' });
+            }).then(function (res) {
+                var ct = (res.headers && res.headers.get) ? res.headers.get('content-type') : '';
+                if (!res.ok || (ct && ct.indexOf('json') < 0)) {
+                    return res.text().then(function (txt) {
+                        throw { httpStatus: res.status, httpText: (txt || '').slice(0, 300) };
+                    });
+                }
+                return res.json();
+            }).then(function (d) {
+                if (d && d.error) throw d.error;
+                var pages = (d && d.query && d.query.allpages) || [];
+                for (var i = 0; i < pages.length; i++) out.push(pages[i].title);
+                if (d && d.continue && d.continue.apcontinue) return next(d.continue.apcontinue);
+                return out;
+            });
+        }
+        return next();
+    }
+
+    // ---- 读单页所有 logs（带退避重试 + 标题变体兜底）----
+    function fetchPage(nb, title, site) {
+        var variants = keyVariants(title);
+        function tryVariant(k) {
+            if (k >= variants.length) return Promise.resolve(null);
+            var base = variants[k];
+            return readWithRetry(nb, base + '/analytics_' + site).then(function (idx) {
+                if (!idx) return tryVariant(k + 1);
+                return readShards(nb, base, site, idx);
+            }).catch(function () { return tryVariant(k + 1); });
+        }
+        return tryVariant(0);
+    }
+
+    function readShards(nb, base, site, idx) {
+        // 旧格式：索引页自带 logs，无分片
+        if (Array.isArray(idx.logs)) {
+            return { title: base, count: idx.logs.length, logs: idx.logs };
+        }
+        var pages = (typeof idx.pages === 'number' && idx.pages >= 0) ? idx.pages : 0;
+        var count = (typeof idx.count === 'number' && idx.count >= 0) ? idx.count : 0;
+        if (pages <= 0) return { title: base, count: count, logs: [] };
+        var ns = [];
+        for (var i = 0; i < pages; i++) ns.push(i);
+        return mapLimit(ns, CONCURRENCY, function (n) {
+            return readWithRetry(nb, base + '/analytics_' + n + '_' + site)
+                .then(function (d) { return (d && d.logs) || []; })
+                .catch(function () { return []; });
+        }).then(function (chunks) {
+            var logs = [].concat.apply([], chunks);
+            return { title: base, count: count, logs: logs };
+        });
+    }
+
+    // ---- 容器定位：优先 #stats-viewer，否则自动挂到统计页 ----
+    function ensureContainer() {
+        var el = document.getElementById('stats-viewer');
+        if (el) return el;
+        var pageName = (mw.config.values && mw.config.values.wgPageName) || '';
+        var target = (typeof window.STATS_VIEWER_PAGE === 'string' && window.STATS_VIEWER_PAGE) || DEFAULT_STATS_PAGE;
+        if (pageName === target) {
+            el = document.createElement('div');
+            el.id = 'stats-viewer';
+            var content = document.getElementById('mw-content-text') || document.body;
+            if (content.firstChild) content.insertBefore(el, content.firstChild);
+            else content.appendChild(el);
+            return el;
+        }
+        return null;
+    }
+
+    function escapeHtml(s) {
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    var STYLE_INJECTED = false;
+    function injectStyle() {
+        if (STYLE_INJECTED) return;
+        STYLE_INJECTED = true;
+        var css = [
+            '.sv-wrap{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;color:#e6e6e6;max-width:960px;margin:0 auto;padding:16px;}',
+            '.sv-cards{display:flex;gap:12px;flex-wrap:wrap;margin:14px 0;}',
+            '.sv-card{flex:1;min-width:160px;background:#1b1f2a;border:1px solid #2a3142;border-radius:12px;padding:16px 18px;}',
+            '.sv-card .v{font-size:30px;font-weight:700;color:#4f8cff;line-height:1.1;}',
+            '.sv-card .k{font-size:13px;opacity:.7;margin:0 0 6px;}',
+            '.sv-sec{margin:22px 0 8px;font-size:17px;font-weight:600;border-left:3px solid #4f8cff;padding-left:10px;color:#ffcf6b;}',
+            '.sv-sub{font-size:12px;font-weight:400;color:#8aa0c0;margin-left:8px;opacity:.85;}',
+            '.sv-table{width:100%;border-collapse:collapse;font-size:14px;}',
+            '.sv-table th,.sv-table td{text-align:left;padding:8px 10px;border-bottom:1px solid #232a38;}',
+            '.sv-table th{opacity:.6;font-weight:600;}',
+            '.sv-table td.num{text-align:right;font-variant-numeric:tabular-nums;}',
+            '.sv-rank{display:inline-block;min-width:22px;text-align:right;opacity:.6;}',
+            '.sv-bar-wrap{display:flex;align-items:flex-end;gap:3px;height:120px;overflow-x:auto;padding:8px 0;border-bottom:1px solid #232a38;}',
+            '.sv-bar{background:#4f8cff;border-radius:2px 2px 0 0;min-width:6px;position:relative;cursor:pointer;}',
+            '.sv-bar-tip{position:fixed;z-index:99999;background:#000;color:#fff;font-size:11px;padding:3px 7px;border-radius:4px;pointer-events:none;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.5);}',
+            '.sv-note{opacity:.6;font-size:12px;margin-top:6px;}',
+            '.sv-loading,.sv-error{padding:30px;text-align:center;opacity:.8;}',
+            '.sv-error{color:#ff6b6b;}',
+            '.sv-tag{display:inline-block;background:#2a3142;border-radius:6px;padding:1px 7px;margin:1px 3px 1px 0;font-size:12px;opacity:.85;}',
+            '.sv-explorer{margin-top:24px;border-top:1px solid #232a38;padding-top:10px;}',
+            '.sv-exp-toggle{transition:color .2s;}',
+            '.sv-exp-toggle:hover{color:#4f8cff;}',
+            '.sv-filters{margin:12px 0;}',
+            '.sv-filter-row{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;}',
+            '.sv-filter-row label{display:flex;flex-direction:column;font-size:12px;opacity:.8;gap:4px;}',
+            '.sv-filter-row input{background:#11151f;border:1px solid #2a3142;border-radius:6px;color:#e6e6e6;padding:6px 8px;font-size:13px;}',
+            '.sv-btn{background:#4f8cff;border:none;color:#fff;border-radius:6px;padding:7px 16px;font-size:13px;cursor:pointer;}',
+            '.sv-btn-ghost{background:#2a3142;}',
+            '.sv-f-table td:nth-child(3),.sv-f-table td:nth-child(4),.sv-f-table td:nth-child(5){max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+            '.sv-tabs{float:right;font-size:12px;font-weight:400;}',
+            '.sv-tab{background:#2a3142;color:#e6e6e6;border:none;border-radius:6px;padding:4px 10px;margin-left:6px;cursor:pointer;font-size:12px;}',
+            '.sv-tab:hover{color:#fff;}',
+            '.sv-tab-active{background:#4f8cff;color:#fff;}',
+            '.sv-pt-select{background:#11151f;border:1px solid #2a3142;border-radius:6px;color:#e6e6e6;padding:6px 8px;font-size:13px;}',
+            '#stats-viewer{background:#141a26;border:1px solid #2a3142;border-radius:12px;padding:18px;margin:16px 0;color:#e6e6e6;}',
+            '.sv-tabbar{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0 18px;border-bottom:1px solid #2a3142;padding-bottom:8px;}',
+            '.sv-tabbtn{background:#1b2230;color:#cdd6e6;border:1px solid #2a3142;border-radius:8px 8px 0 0;padding:9px 18px;font-size:14px;cursor:pointer;font-family:inherit;}',
+            '.sv-tabbtn:hover{color:#fff;}',
+            '.sv-tabbtn-active{background:#4f8cff;color:#fff;border-color:#4f8cff;}',
+            '.sv-scroll{max-height:360px;overflow-y:auto;overflow-x:hidden;border:1px solid #232a38;border-radius:8px;}',
+            '.sv-scroll .sv-table th,.sv-scroll .sv-table td{border-bottom:1px solid #232a38;text-align: center;color: #ffffff;}',
+            '.sv-denied{padding:40px;text-align:center;color:#ffb454;font-size:15px;}',
+            // 进度条（总览饼图 / 时间维度 / 明细 共用）
+            '.sv-progress{height:8px;background:#232a38;border-radius:4px;overflow:hidden;margin:8px 0;width:100%;max-width:420px;}',
+            '.sv-progress-bar{height:100%;background:#4f8cff;width:0;transition:width .15s linear;}',
+            '.sv-pct{font-size:12px;opacity:.8;}',
+            // 访问环境分布饼图
+            '.sv-pies{display:flex;gap:16px;flex-wrap:wrap;margin:10px 0 4px;}',
+            '.sv-pie{background:#1b1f2a;border:1px solid #2a3142;border-radius:10px;padding:12px 14px;min-width:240px;}',
+            '.sv-pie-title{font-size:14px;font-weight:600;margin-bottom:6px;color:#ffcf6b;}',
+            '.sv-pie-svg{display:block;}',
+            '.sv-pie-legend{font-size:12px;margin-top:6px;line-height:1.7;}',
+            // 用户行为面板
+            '.sv-behavior-row{display:flex;align-items:center;gap:10px;margin:8px 0;font-size:13px;}',
+            '.sv-behavior-k{width:96px;text-align:right;opacity:.8;}',
+            '.sv-behavior-bar{height:14px;background:#4f8cff;border-radius:7px;min-width:3px;max-width:60%;}',
+            '.sv-behavior-c{opacity:.9;font-variant-numeric:tabular-nums;}',
+            '.sv-pie-legend-row{white-space:nowrap;}',
+            '.sv-pie-dot{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px;vertical-align:middle;}',
+            '.sv-f-scroll{overflow-x:auto;max-width:100%;contain:content;}',
+            // 页面/用户访问排行：标题白色 + 表格内容居中（用户要求 #ffffff + 居中）
+            '.sv-panel[data-panel="pages"] .sv-sec, .sv-panel[data-panel="users"] .sv-sec{color:#ffffff;}',
+            '.sv-panel[data-panel="pages"] .sv-table th, .sv-panel[data-panel="pages"] .sv-table td,' +
+            '.sv-panel[data-panel="users"] .sv-table th, .sv-panel[data-panel="users"] .sv-table td{text-align:center;}',
+            // 滚动性能优化：隔离重排/重绘，避免大表格滚动卡顿
+            '.sv-scroll{contain:content;}',
+            '.sv-panel[data-panel="pages"] .sv-table, .sv-panel[data-panel="users"] .sv-table{table-layout:fixed;}'
+        ].join('');
+        var style = document.createElement('style');
+        style.textContent = css;
+        (document.head || document.documentElement).appendChild(style);
+    }
+
+    function render(container, agg) {
+        injectStyle();
+        var hasBehavior = !!(agg.actionsByDay && Object.keys(agg.actionsByDay).length);
+        var html = ['<div class="sv-wrap">'];
+
+        // ===== 顶部分页标签 =====
+        html.push('<div class="sv-tabbar">' +
+            '<button class="sv-tabbtn sv-tabbtn-active" data-tab="overview" type="button">总览</button>' +
+            '<button class="sv-tabbtn" data-tab="pages" type="button">页面访问排行</button>' +
+            '<button class="sv-tabbtn" data-tab="users" type="button">用户访问排行</button>' +
+            '<button class="sv-tabbtn" data-tab="trend" type="button">趋势</button>' +
+            '<button class="sv-tabbtn" data-tab="detail" type="button">明细</button>' +
+            (hasBehavior ? '<button class="sv-tabbtn" data-tab="behavior" type="button">用户行为</button>' : '') +
+            '</div>');
+
+        // ===== 总览面板 =====
+        html.push('<div class="sv-panel" data-panel="overview">');
+        html.push('<div class="sv-cards">');
+        html.push('<div class="sv-card"><div class="k">总访问次数</div><div class="v">' + agg.total.toLocaleString() + '</div></div>');
+        html.push('<div class="sv-card"><div class="k">B站用户访问数（去重 UID）</div><div class="v">' + agg.uniqueUsers.toLocaleString() + '</div></div>');
+        html.push('<div class="sv-card"><div class="k">被统计页面数</div><div class="v">' + agg.pageCount.toLocaleString() + '</div></div>');
+        html.push('</div>');
+        if (agg.byUser.length) {
+            var rs0 = returnStats(agg.byUser);
+            html.push('<div class="sv-sec">用户回访分析（Return Rate）</div>');
+            html.push('<div class="sv-cards">');
+            html.push('<div class="sv-card"><div class="k">回访率（Return Rate）</div><div class="v">' + (rs0.returnRate * 100).toFixed(0) + '%</div></div>');
+            html.push('<div class="sv-card"><div class="k">回访用户（≥2 次访问）</div><div class="v">' + rs0.returningUsers.toLocaleString() + '</div></div>');
+            html.push('<div class="sv-card"><div class="k">单次访问用户</div><div class="v">' + rs0.oneTimeUsers.toLocaleString() + '</div></div>');
+            html.push('<div class="sv-card"><div class="k">回访用户人均访问次数</div><div class="v">' + rs0.avgVisitsReturning.toFixed(1) + '</div></div>');
+            html.push('</div>');
+            html.push('<div class="sv-note">基于 ' + rs0.total + ' 位 B站用户（去重 UID）的每用户访问次数统计（无需扫描原始分片）。</div>');
+        }
+
+        // ===== 访问环境分布（上限 / 流量视图：按访问次数）=====
+        html.push('<div class="sv-sec">访问环境分布 <span class="sv-sub">流量视图 · 按访问次数</span></div>');
+        if (agg.devices) {
+            // V2 模式：直接来自维度分表，无需扫描原始记录（秒开）
+            html.push('<div class="sv-pies">' +
+                pieBlock('设备类型', agg.devices.items, agg.devices.total) +
+                pieBlock('系统', agg.systems.items, agg.systems.total) +
+                pieBlock('浏览器', agg.browsers.items, agg.browsers.total) +
+                '</div>');
+            html.push('<div class="sv-note">反映「流量长什么样」：每条访问独立计数（重访用户会放大自身偏好）。用于前端 QA 范围与容量规划。</div>');
+        } else {
+            // 旧路径（v1 / 原始扫描）：后台扫描原始记录后再渲染，期间显示真实进度条
+            html.push('<div id="sv-pies" class="sv-pies-loading">正在统计设备类型 / 系统 / 浏览器分布（需扫描原始记录，首次较慢）…' +
+                '<div class="sv-progress"><div class="sv-progress-bar" id="sv-pies-bar"></div></div>' +
+                '<span id="sv-pies-pct" class="sv-pct">0%</span></div>');
+        }
+
+        // ===== 受众分析（下限 / 用户视图：按独立用户去重）=====
+        html.push('<div class="sv-sec">受众分析 <span class="sv-sub">用户视图 · 按独立用户去重</span></div>');
+        if (agg.audienceDevices) {
+            html.push('<div class="sv-pies">' +
+                pieBlock('设备类型', agg.audienceDevices.items, agg.audienceDevices.total) +
+                pieBlock('系统', agg.audienceSystems.items, agg.audienceSystems.total) +
+                pieBlock('浏览器', agg.audienceBrowsers.items, agg.audienceBrowsers.total) +
+                '</div>');
+            html.push('<div class="sv-note">反映「登录的 B站用户里，多少人在用什么环境」：同一用户的多种设备/浏览器各计一次，百分比之和可能 &gt;100%。这是站长判断「该适配 PC 还是移动端」的依据。</div>');
+        } else {
+            html.push('<div class="sv-note">暂无受众数据（需运行迁移工具回填，或等待实时访问积累）。</div>');
+        }
+
+        html.push('</div>'); // /overview
+
+        // ===== 页面排行面板（含时间维度切换：累计 / 按天 / 按月 / 按年） =====
+        _pageTop.agg = agg;
+        html.push('<div class="sv-panel" data-panel="pages" style="display:none;">');
+        html.push('<div class="sv-sec">页面访问量 Top 50' +
+            '<span class="sv-tabs">' +
+            '<button class="sv-tab sv-tab-active" data-unit="all" type="button">累计</button>' +
+            '<button class="sv-tab" data-unit="day" type="button">按天</button>' +
+            '<button class="sv-tab" data-unit="month" type="button">按月</button>' +
+            '<button class="sv-tab" data-unit="year" type="button">按年</button>' +
+            '</span></div>');
+        html.push('<div id="sv-pagetop-body">' + pageTopAllHtml(agg) + '</div>');
+        html.push('</div>'); // /pages
+
+        // ===== 用户排行面板 =====
+        html.push('<div class="sv-panel" data-panel="users" style="display:none;">');
+        html.push('<div class="sv-sec">用户访问活跃度 Top ' + Math.min(agg.byUser.length, MAX_USER_ROWS) + '</div>');
+        if (agg.byUser.length) {
+            html.push('<div class="sv-scroll"><table class="sv-table"><thead><tr><th>#</th><th>UID</th><th class="num">访问次数</th><th class="num">访问页面数</th><th>最新访问</th></tr></thead><tbody>');
+            var uTop = agg.byUser.slice(0, MAX_USER_ROWS);
+            for (var u = 0; u < uTop.length; u++) {
+                html.push('<tr><td class="num"><span class="sv-rank">' + (u + 1) + '</span></td><td>' + escapeHtml(uTop[u].uid) + '</td><td class="num">' + uTop[u].count.toLocaleString() + '</td><td class="num">' + (uTop[u].pageCount ? uTop[u].pageCount : '-') + '</td><td>' + escapeHtml(fmtTime(uTop[u].lastTime)) + '</td></tr>');
+            }
+            html.push('</tbody></table></div>');
+            if (agg.byUser.length > MAX_USER_ROWS) html.push('<div class="sv-note">仅显示 Top ' + MAX_USER_ROWS + ' / 共 ' + agg.byUser.length + ' 位用户</div>');
+
+            var hasDetail = agg.byUser.length && agg.byUser[0] && agg.byUser[0].pages;
+            if (hasDetail) {
+                html.push('<div class="sv-sec">用户访问明细</div>');
+                html.push('<div class="sv-note">展开查看每位用户访问过的页面（按访问次数降序）</div>');
+                var detailLimit = Math.min(agg.byUser.length, MAX_USER_ROWS);
+                for (var k = 0; k < detailLimit; k++) {
+                    var user = agg.byUser[k];
+                    var pageKeys = Object.keys(user.pages).sort(function (a, b) { return user.pages[b] - user.pages[a]; });
+                    var tags = '';
+                    for (var pk = 0; pk < pageKeys.length; pk++) {
+                        tags += '<span class="sv-tag">' + escapeHtml(pageKeys[pk]) + ' ×' + user.pages[pageKeys[pk]] + '</span>';
+                    }
+                    html.push('<div style="margin:8px 0;padding:8px 10px;background:#1b1f2a;border:1px solid #2a3142;border-radius:8px;"><div><b>' + escapeHtml(user.uid) + '</b> · 共 ' + user.count + ' 次 · ' + user.pageCount + ' 个页面 · ' + escapeHtml(fmtTime(user.lastTime)) + '</div><div style="margin-top:4px;">' + tags + '</div></div>');
+                }
+            } else if (agg.byUser.length) {
+                html.push('<div class="sv-note">汇总模式不记录「每用户访问了哪些页面」明细，仅展示访问次数与最新时间。</div>');
+            }
+        } else {
+            html.push('<div class="sv-note">暂无数据</div>');
+        }
+        html.push('</div>'); // /users
+
+        // ===== 趋势面板 =====
+        html.push('<div class="sv-panel" data-panel="trend" style="display:none;">');
+        html.push('<div class="sv-sec">按天访问趋势</div>');
+        if (agg.byDay.length) {
+            var days = agg.byDay.slice(-MAX_DAY_BARS);
+            var maxDay = 0;
+            for (var i = 0; i < days.length; i++) maxDay = Math.max(maxDay, days[i].count);
+            html.push('<div class="sv-bar-wrap">');
+            for (var d = 0; d < days.length; d++) {
+                var h = maxDay > 0 ? Math.max(2, Math.round(days[d].count / maxDay * 110)) : 2;
+                html.push('<div class="sv-bar" style="height:' + h + 'px" data-t="' + escapeHtml(days[d].day + ' · ' + days[d].count) + '"></div>');
+            }
+            html.push('</div>');
+            html.push('<div class="sv-note">共 ' + agg.byDay.length + ' 天有记录（显示最近 ' + days.length + ' 天）</div>');
+        } else {
+            html.push('<div class="sv-note">暂无数据</div>');
+        }
+        html.push('</div>'); // /trend
+
+        // ===== 明细面板（explorer 挂载于此） =====
+        html.push('<div class="sv-panel" data-panel="detail" style="display:none;"></div>');
+
+        // ===== 用户行为面板（仅 V2 汇总含 wgAction 维度时渲染） =====
+        if (hasBehavior) {
+            html.push('<div class="sv-panel" data-panel="behavior" style="display:none;">' + renderBehaviorHtml(agg) + '</div>');
+        }
+
+        html.push('</div>');
+        container.innerHTML = html.join('');
+    }
+
+    // ---- 分页标签切换 ----
+    function mountTabs(container) {
+        var btns = container.querySelectorAll('.sv-tabbtn');
+        var panels = container.querySelectorAll('.sv-panel');
+        if (!btns.length) return;
+        for (var i = 0; i < btns.length; i++) {
+            (function (btn) {
+                btn.addEventListener('click', function () {
+                    var id = btn.getAttribute('data-tab');
+                    for (var j = 0; j < btns.length; j++) btns[j].classList.toggle('sv-tabbtn-active', btns[j] === btn);
+                    for (var p = 0; p < panels.length; p++) {
+                        panels[p].style.display = (panels[p].getAttribute('data-panel') === id) ? '' : 'none';
+                    }
+                });
+            })(btns[i]);
+        }
+    }
+
+    // ---- 趋势图浮动提示（挂到 body，避免被父级 overflow 裁切） ----
+    function mountChartTooltip(container) {
+        var wrap = container.querySelector('.sv-bar-wrap');
+        if (!wrap) return;
+        var tip = null;
+        function show(e, text) {
+            if (!tip) { tip = document.createElement('div'); tip.className = 'sv-bar-tip'; document.body.appendChild(tip); }
+            tip.textContent = text;
+            tip.style.display = 'block';
+            tip.style.left = (e.clientX + 12) + 'px';
+            tip.style.top = (e.clientY - 10) + 'px';
+        }
+        function hide() { if (tip) tip.style.display = 'none'; }
+        wrap.addEventListener('mouseover', function (e) {
+            var bar = e.target && e.target.closest ? e.target.closest('.sv-bar') : null;
+            if (bar) show(e, bar.getAttribute('data-t'));
+        });
+        wrap.addEventListener('mousemove', function (e) {
+            var bar = e.target && e.target.closest ? e.target.closest('.sv-bar') : null;
+            if (bar) show(e, bar.getAttribute('data-t')); else hide();
+        });
+        wrap.addEventListener('mouseout', hide);
+    }
+
+    // ---- 进度条更新（多场景共用：总览饼图 / 时间维度 / 明细） ----
+    function updateBar(barId, pctId, done, total) {
+        var pct = total > 0 ? Math.round(done / total * 100) : 0;
+        var bar = document.getElementById(barId);
+        if (bar) bar.style.width = pct + '%';
+        var txt = document.getElementById(pctId);
+        if (txt) txt.textContent = pct + '%';
+    }
+
+    // ---- 环形饼图（SVG） ----
+    var PIE_PALETTE = ['#4f8cff', '#ffcf6b', '#43d17a', '#ff7a7a', '#b388ff', '#ff9f43',
+        '#36cfc9', '#f368e0', '#95de64', '#ff7875', '#ffc53d', '#69b1ff'];
+
+    // 把分布画成环形图（每个扇区带原生 <title> 悬停提示）
+    function pieSvg(dist, total) {
+        if (!total) return '<div class="sv-note">暂无数据</div>';
+        var outerR = 54, innerR = 32, midR = (outerR + innerR) / 2, stroke = outerR - innerR;
+        var cx = 60, cy = 60, circ = 2 * Math.PI * midR;
+        var off = 0, segs = '';
+        for (var i = 0; i < dist.length; i++) {
+            var frac = dist[i].count / total;
+            var len = frac * circ;
+            var color = PIE_PALETTE[i % PIE_PALETTE.length];
+            segs += '<circle cx="' + cx + '" cy="' + cy + '" r="' + midR + '" fill="none" stroke="' + color +
+                '" stroke-width="' + stroke + '" stroke-dasharray="' + len.toFixed(2) + ' ' + (circ - len).toFixed(2) +
+                '" stroke-dashoffset="' + (-off).toFixed(2) + '" transform="rotate(-90 ' + cx + ' ' + cy + ')">' +
+                '<title>' + escapeHtml(dist[i].key + '：' + dist[i].count + '（' + (frac * 100).toFixed(1) + '%）') + '</title></circle>';
+            off += len;
+        }
+        return '<svg width="120" height="120" viewBox="0 0 120 120" class="sv-pie-svg">' + segs + '</svg>';
+    }
+
+    function pieBlock(title, dist, total) {
+        var legend = dist.map(function (d, i) {
+            var pct = total ? (d.count / total * 100).toFixed(1) : '0';
+            return '<div class="sv-pie-legend-row"><span class="sv-pie-dot" style="background:' + PIE_PALETTE[i % PIE_PALETTE.length] + '"></span>' +
+                escapeHtml(d.key) + '：' + d.count.toLocaleString() + '（' + pct + '%）</div>';
+        }).join('');
+        return '<div class="sv-pie"><div class="sv-pie-title">' + escapeHtml(title) + '</div>' +
+            pieSvg(dist, total) + '<div class="sv-pie-legend">' + legend + '</div></div>';
+    }
+
+    // 由缓存的全部记录渲染「设备类型 / 系统 / 浏览器」三张饼图（替换占位进度区）
+    function renderPies(container, records) {
+        var host = container.querySelector('#sv-pies');
+        if (!host) return;
+        var formD = StatsViewer.distribute(records, function (r) { return parseForm(r.ua); });
+        var osD = StatsViewer.distribute(records, function (r) { return parseOS(r.ua); });
+        var brD = StatsViewer.distribute(records, function (r) { return parseBrowser(r.ua); });
+        host.className = 'sv-pies';
+        host.innerHTML =
+            pieBlock('设备类型', formD.items, formD.total) +
+            pieBlock('系统', osD.items, osD.total) +
+            pieBlock('浏览器', brD.items, brD.total);
+    }
+
+    // ---- 用户行为面板 HTML（wgAction 按日期分布） ----
+    function renderBehaviorHtml(agg) {
+        var byDay = agg.actionsByDay || {};
+        var total = agg.actionsTotal || {};
+        var actions = Object.keys(total).sort(function (a, b) { return total[b] - total[a]; });
+        if (!actions.length) return '<div class="sv-note">暂无行为数据（旧数据未记录 wgAction）。</div>';
+
+        var maxA = 0; for (var i = 0; i < actions.length; i++) maxA = Math.max(maxA, total[actions[i]]);
+        var bars = actions.map(function (a) {
+            var c = total[a];
+            var w = maxA > 0 ? Math.max(2, Math.round(c / maxA * 100)) : 2;
+            return '<div class="sv-behavior-row"><span class="sv-behavior-k">' + escapeHtml(a) + '</span>' +
+                '<span class="sv-behavior-bar" style="width:' + w + '%"></span>' +
+                '<span class="sv-behavior-c">' + c.toLocaleString() + '</span></div>';
+        }).join('');
+
+        var dates = Object.keys(byDay).sort();
+        var head = '<th>日期</th>' + actions.map(function (a) { return '<th class="num">' + escapeHtml(a) + '</th>'; }).join('');
+        var rows = dates.map(function (d) {
+            var sub = byDay[d] || {};
+            var cells = actions.map(function (a) { return '<td class="num">' + (sub[a] || 0).toLocaleString() + '</td>'; }).join('');
+            return '<tr><td>' + escapeHtml(d) + '</td>' + cells + '</tr>';
+        }).join('');
+
+        return '<div class="sv-sec">行为分布概览（按 wgAction 合计）</div>' + bars +
+            '<div class="sv-sec">按日期行为明细</div>' +
+            '<div class="sv-scroll"><table class="sv-table"><thead><tr>' + head + '</tr></thead><tbody>' + rows + '</tbody></table></div>' +
+            '<div class="sv-note">行为取自 MediaWiki wgAction（view=浏览 / edit=编辑 等）。旧数据未记录 wgAction 时该维度为空。</div>';
+    }
+
+    // ---- 明细浏览器：把筛选后的记录渲染成表格 ----
+    function renderExplorer(body, records, criteria) {
+        var tableEl = body.querySelector('#sv-f-table');
+        var countEl = body.querySelector('#sv-f-count');
+        if (!tableEl) return;
+        var filtered = filterRecords(records, criteria || {});
+        var sorted = sortRecords(filtered, { key: 'time', dir: 'desc' });
+        countEl.textContent = '匹配 ' + sorted.length + ' / 共 ' + records.length + ' 条' +
+            (sorted.length > MAX_RECORD_ROWS ? '（为性能仅显示前 ' + MAX_RECORD_ROWS + ' 条，请用筛选缩小范围）' : '');
+        if (!sorted.length) {
+            tableEl.innerHTML = '<div class="sv-note">没有符合条件的记录。</div>';
+            return;
+        }
+        var rows = sorted.slice(0, MAX_RECORD_ROWS);
+        var html = '<div class="sv-f-scroll"><table class="sv-table sv-f-table"><thead><tr>' +
+            '<th>时间</th><th>UID</th><th>页面</th><th>来源 URL</th><th>UA</th><th>wikiid</th>' +
+            '<th>系统</th><th>设备</th><th>浏览器</th><th>内核</th>' +
+            '</tr></thead><tbody>';
+        for (var i = 0; i < rows.length; i++) {
+            var r = rows[i];
+            var pu = parseUA(r.ua);
+            var eng = pu.engine + (pu.engineVer != null ? ' ' + pu.engineVer : '');
+            html += '<tr>' +
+                '<td>' + escapeHtml(fmtTime(r.time)) + '</td>' +
+                '<td>' + escapeHtml(r.uid) + '</td>' +
+                '<td>' + escapeHtml(r._page) + '</td>' +
+                '<td title="' + escapeHtml(r.page) + '">' + escapeHtml(r.page) + '</td>' +
+                '<td title="' + escapeHtml(r.ua) + '">' + escapeHtml(r.ua) + '</td>' +
+                '<td>' + escapeHtml(r.wikiid) + '</td>' +
+                '<td>' + escapeHtml(pu.os) + '</td>' +
+                '<td>' + escapeHtml(pu.form) + '</td>' +
+                '<td>' + escapeHtml(pu.browser) + '</td>' +
+                '<td>' + escapeHtml(eng) + '</td>' +
+                '</tr>';
+        }
+        html += '</tbody></table></div>';
+        tableEl.innerHTML = html;
+    }
+
+    // ---- 页面 Top 榜「累计」视图 HTML（从汇总页 pages 秒出） ----
+    function pageTopAllHtml(agg) {
+        agg = agg || { byPage: [], total: 0 };
+        if (!agg.byPage || !agg.byPage.length) return '<div class="sv-note">暂无数据</div>';
+        var top = agg.byPage.slice(0, 50);
+        var html = '<div class="sv-scroll"><table class="sv-table"><thead><tr><th>#</th><th>页面</th><th class="num">访问数</th><th class="num">占比</th></tr></thead><tbody>';
+        for (var p = 0; p < top.length; p++) {
+            var pct = agg.total > 0 ? (top[p].count / agg.total * 100).toFixed(1) + '%' : '0%';
+            html += '<tr><td class="num"><span class="sv-rank">' + (p + 1) + '</span></td><td>' + escapeHtml(top[p].title) + '</td><td class="num">' + top[p].count.toLocaleString() + '</td><td class="num">' + pct + '</td></tr>';
+        }
+        html += '</tbody></table></div>';
+        if (agg.byPage.length > 50) html += '<div class="sv-note">仅显示 Top 50 / 共 ' + agg.byPage.length + ' 个页面</div>';
+        return html;
+    }
+
+    // ---- 页面 Top 榜「按时间维度」视图 HTML（需原始记录，按选定时段聚合） ----
+    function pageTopTimeHtml(unit, records, selectedKey) {
+        var res = aggregatePagesByTime(records, unit, 50);
+        var buckets = res.buckets;
+        if (!buckets.length) return '<div class="sv-note">该时间维度下暂无数据</div>';
+        var keys = buckets.map(function (b) { return b.key; });
+        var countMap = Object.create(null);
+        buckets.forEach(function (b) { countMap[b.key] = b.count; });
+        if (!selectedKey || keys.indexOf(selectedKey) < 0) selectedKey = keys[0]; // 默认最新时段
+        var bucket = null;
+        for (var i = 0; i < buckets.length; i++) if (buckets[i].key === selectedKey) bucket = buckets[i];
+        var label = unit === 'day' ? '日期' : (unit === 'month' ? '月份' : '年份');
+        var html = '<div class="sv-filter-row" style="margin-bottom:10px;">' +
+            '<label>' + label + '<select id="sv-pt-select" class="sv-pt-select">' +
+            keys.map(function (k) {
+                return '<option value="' + escapeHtml(k) + '"' + (k === selectedKey ? ' selected' : '') + '>' + escapeHtml(k) + '（' + (countMap[k] || 0).toLocaleString() + ' 次）</option>';
+            }).join('') +
+            '</select></label>' +
+            '<span class="sv-note">占比以该时段总访问数为分母</span></div>';
+        var top = (bucket ? bucket.byPage : []).slice(0, 50);
+        html += '<div class="sv-scroll"><table class="sv-table"><thead><tr><th>#</th><th>页面</th><th class="num">访问数</th><th class="num">占比</th></tr></thead><tbody>';
+        for (var p = 0; p < top.length; p++) {
+            var pct = bucket.count > 0 ? (top[p].count / bucket.count * 100).toFixed(1) + '%' : '0%';
+            html += '<tr><td class="num"><span class="sv-rank">' + (p + 1) + '</span></td><td>' + escapeHtml(top[p].title) + '</td><td class="num">' + top[p].count.toLocaleString() + '</td><td class="num">' + pct + '</td></tr>';
+        }
+        html += '</tbody></table></div>';
+        if (bucket.byPage.length > 50) html += '<div class="sv-note">仅显示 Top 50 / 共 ' + bucket.byPage.length + ' 个页面</div>';
+        return html;
+    }
+
+    // ---- 确保所有原始记录已加载并缓存（明细浏览器与时间维度Top共用，防双扫） ----
+    // onProgress(done, total) 可选：多个调用方（总览饼图 / 时间维度 / 明细）可分别注册，
+    // 扫描过程中每个页面完成时统一广播给所有监听者，各自更新自己的进度条。
+    function ensureAllRecords(nb, site, onProgress) {
+        if (onProgress && typeof onProgress === 'function') {
+            if (!_explorerState.progressListeners) _explorerState.progressListeners = [];
+            _explorerState.progressListeners.push(onProgress);
+        }
+        if (_explorerState.records) {
+            if (onProgress) {
+                var t = _explorerState._total || 0;
+                onProgress(t, t);
+            }
+            return Promise.resolve(_explorerState.records);
+        }
+        if (!_explorerState._promise) {
+            _explorerState.loading = true;
+            logInfo('[stats-viewer] 首次加载全部原始记录（扫描分片）…');
+            _explorerState._promise = loadAllRecords(nb, site, function (done, total) {
+                _explorerState._total = total;
+                var ls = _explorerState.progressListeners || [];
+                for (var i = 0; i < ls.length; i++) ls[i](done, total);
+            }).then(function (recs) {
+                _explorerState.records = recs;
+                _explorerState.loading = false;
+                return recs;
+            }).catch(function (e) {
+                _explorerState.loading = false;
+                throw e;
+            });
+        }
+        return _explorerState._promise;
+    }
+
+    // ---- 时间维度页面Top 的 tab 交互（累计秒出；按下/月/年首次扫原始分片，之后即时切换） ----
+    function mountPageTopTabs(container, nb, site) {
+        var body = container.querySelector('#sv-pagetop-body');
+        var tabs = container.querySelectorAll('.sv-tab');
+        if (!body || !tabs.length) return;
+
+        function markActive(unit) {
+            for (var i = 0; i < tabs.length; i++) {
+                tabs[i].classList.toggle('sv-tab-active', tabs[i].getAttribute('data-unit') === unit);
+            }
+        }
+        function showAll() {
+            markActive('all');
+            body.innerHTML = pageTopAllHtml(_pageTop.agg);
+        }
+        function paintUnit(unit, recs, selectedKey) {
+            body.innerHTML = pageTopTimeHtml(unit, recs, selectedKey);
+            var sel = body.querySelector('#sv-pt-select');
+            if (sel) {
+                sel.addEventListener('change', function () {
+                    if (!_pageTop.selected) _pageTop.selected = {};
+                    _pageTop.selected[unit] = sel.value;
+                    paintUnit(unit, recs, sel.value); // 递归重绘并重新绑定
+                });
+            }
+        }
+        function showUnit(unit) {
+            markActive(unit);
+            if (_explorerState.records) {
+                paintUnit(unit, _explorerState.records, _pageTop.selected && _pageTop.selected[unit]);
+                return;
+            }
+            body.innerHTML = '<div class="sv-loading">正在加载原始记录以按时间统计（首次较慢，之后即时切换）…' +
+                '<div class="sv-progress"><div class="sv-progress-bar" id="sv-pt-bar"></div></div>' +
+                '<span id="sv-pt-pct" class="sv-pct">0%</span></div>';
+            ensureAllRecords(nb, site, function (done, total) {
+                updateBar('sv-pt-bar', 'sv-pt-pct', done, total);
+            }).then(function (recs) {
+                paintUnit(unit, recs, _pageTop.selected && _pageTop.selected[unit]);
+            }).catch(function (e) {
+                body.innerHTML = '<div class="sv-error">加载失败：' + escapeHtml(describeError(e)) + '</div>';
+            });
+        }
+
+        for (var t = 0; t < tabs.length; t++) {
+            (function (tab) {
+                tab.addEventListener('click', function () {
+                    var u = tab.getAttribute('data-unit');
+                    _pageTop.unit = u;
+                    if (u === 'all') showAll(); else showUnit(u);
+                });
+            })(tabs[t]);
+        }
+    }
+
+    function boot() {
+        if (booted) return;
+        booted = true;
+
+        var tries = 0;
+        (function wait() {
+            if (typeof NGBASE !== 'undefined' && typeof jQuery !== 'undefined' && typeof mw !== 'undefined') return run();
+            if (tries++ < 50) return setTimeout(wait, 100);
+            if (window.console) console.warn('[stats-viewer] NGBASE / jQuery / mw 未就绪（需先引入 MediaWiki:Api.js）');
+        })();
+
+        function run() {
+            var container = ensureContainer();
+            if (!container) return; // 当前页面不需要渲染报表
+
+            // ===== 权限门禁：仅「行政员」(bureaucrat) 或「管理员」(sysop) 可查看 =====
+            var groups = (mw.config.values && mw.config.values.wgUserGroups) || [];
+            var allowed = ALLOWED_GROUPS.some(function (g) { return groups.indexOf(g) >= 0; });
+            if (!allowed) {
+                if (window.console) console.info('[stats-viewer] 当前用户组 ' + JSON.stringify(groups) + ' 不在允许列表 ' + JSON.stringify(ALLOWED_GROUPS) + '，拒绝加载统计');
+                container.innerHTML = '<div class="sv-denied">⛔ 权限不足：仅「行政员」或「管理员」可查看全站访问统计。</div>';
+                return;
+            }
+
+            if (window.console) console.info('[stats-viewer] 开始读取全站统计…');
+            container.innerHTML = '<div class="sv-loading">正在读取全站访问统计数据…</div>';
+
+            var site = (mw.config.values && mw.config.values.wgGameName) || '';
+            if (window.console) console.info('[stats-viewer] 当前站点 =', JSON.stringify(site));
+            var nb = withThrottle(new NGBASE()); // 所有读取经全局节流，避免打爆 data wiki
+
+            // 优先 V2 轻量汇总：读索引 + 维度分表，秒开，无需扫描原始分片
+            readSummaryV2(nb, site).then(function (v2) {
+                if (v2 && (v2.total > 0 || v2.uniqueUsers > 0 || (v2.pages && Object.keys(v2.pages).length))) {
+                    var agg = StatsViewer.aggregateSummaryV2(v2);
+                    if (window.console) console.info('[stats-viewer] V2 汇总结算：总访问 ' + agg.total + '，独立访客 ' + agg.uniqueUsers + '，页面 ' + agg.pageCount);
+                    render(container, agg);
+                    mountTabs(container);
+                    mountChartTooltip(container);
+                    mountExplorer(container, nb, site);   // 明细按需触发原始扫描
+                    mountPageTopTabs(container, nb, site);
+                    // V2 模式：环境分布饼图直接来自维度分表（已在 render 内渲染），不扫描原始记录
+                    return;
+                }
+                // 无 V2 汇总页：回退 v1 汇总
+                return readSummary(nb, site).then(function (sum) {
+                    if (sum && (sum.total > 0 || sum.uniqueUsers > 0 || Object.keys(sum.pages || {}).length)) {
+                        var agg = StatsViewer.aggregateSummary(sum);
+                        if (window.console) console.info('[stats-viewer] 汇总结算：总访问 ' + agg.total + '，独立访客 ' + agg.uniqueUsers + '，页面 ' + agg.pageCount);
+                        render(container, agg);
+                        mountTabs(container);
+                        mountChartTooltip(container);
+                        mountExplorer(container, nb, site);
+                        mountPageTopTabs(container, nb, site);
+                        // 后台预扫原始记录：供「访问环境分布」饼图渲染，并让明细/时间维度面板秒开。
+                        ensureAllRecords(nb, site, function (done, total) {
+                            updateBar('sv-pies-bar', 'sv-pies-pct', done, total);
+                        }).then(function (recs) {
+                            renderPies(container, recs);
+                        }).catch(function () {});
+                        return;
+                    }
+                    // 无 v1 汇总页（过渡期 / 旧数据未迁移）：回退到原始分片全量扫描
+                    if (window.console) console.info('[stats-viewer] 未找到汇总页，回退原始分片扫描（如需提速请执行 StatsViewer.backfill()）…');
+                    return fallbackRawScan(nb, site, container).then(function () {
+                        mountExplorer(container, nb, site);
+                    });
+                });
+            }).catch(function (e) {
+                if (window.console) console.warn('[stats-viewer] 读取失败：', e);
+                container.innerHTML = '<div class="sv-error">读取失败：' + escapeHtml(describeError(e)) + '</div>';
+            });
+        }
+
+        // 回退：扫描所有原始分片（仅在汇总页缺失时触发，迁移后不再走这里）
+        function fallbackRawScan(nb, site, container) {
+            return apiListPages('GLOBAL/').then(function (titles) {
+                var RE = rawPageRegex(site);
+                var titleSet = Object.create(null);
+                for (var i = 0; i < titles.length; i++) {
+                    var m = RE.exec(titles[i]);
+                    if (!m) continue;
+                    if (m[3] !== site) continue;          // 只统计当前站点
+                    titleSet[m[1]] = true;
+                }
+                var titlesArr = Object.keys(titleSet);
+                if (!titlesArr.length) {
+                    container.innerHTML = '<div class="sv-note">当前站点（' + escapeHtml(site) + '）暂无统计数据。</div>';
+                    return;
+                }
+                if (window.console) console.info('[stats-viewer] 发现 ' + titlesArr.length + ' 个页面的统计数据，开始读取…');
+                return mapLimit(titlesArr, CONCURRENCY, function (title) {
+                    return fetchPage(nb, title, site);
+                }).then(function (pages) {
+                    var valid = pages.filter(Boolean);
+                    var agg = StatsViewer.aggregate(valid);
+                    if (window.console) console.info('[stats-viewer] 聚合完成：总访问 ' + agg.total + '，独立访客 ' + agg.uniqueUsers + '，页面 ' + agg.pageCount);
+                    render(container, agg);
+                    mountPageTopTabs(container, nb, site);
+                });
+            });
+        }
+    }
+
+    // ---- 记录明细浏览器：折叠面板 + 筛选控件（数据源走原始分片扫描） ----
+    function mountExplorer(container, nb, site) {
+        if (container.querySelector('.sv-explorer')) return; // 防重复挂载
+        injectStyle();
+        var target = container.querySelector('[data-panel="detail"]') || container;
+        var sec = document.createElement('div');
+        sec.className = 'sv-explorer';
+            sec.innerHTML =
+            '<div class="sv-sec sv-exp-toggle" id="sv-exp-toggle" style="cursor:pointer;user-select:none;">' +
+            '📋 查看全部访问记录 <span class="sv-note">（可按 UID / 时间 / 页面筛选，点击展开）</span></div>' +
+            '<div id="sv-exp-body" style="display:none;"></div>';
+        target.appendChild(sec);
+
+        var body = sec.querySelector('#sv-exp-body');
+        var toggle = sec.querySelector('#sv-exp-toggle');
+
+        function ensureLoaded() {
+            if (_explorerState.records) { renderExplorer(body, _explorerState.records, {}); return; }
+            body.innerHTML = '<div class="sv-loading">正在读取全部访问记录（需扫描所有分片，请稍候）…' +
+                '<div class="sv-progress"><div class="sv-progress-bar" id="sv-exp-bar"></div></div>' +
+                '<span id="sv-exp-pct" class="sv-pct">0%</span></div>';
+            ensureAllRecords(nb, site, function (done, total) {
+                updateBar('sv-exp-bar', 'sv-exp-pct', done, total);
+            }).then(function (records) {
+                body.innerHTML = '';
+                renderExplorerControls(body);
+                renderExplorer(body, records, {});
+                if (window.console) console.info('[stats-viewer] 记录明细加载完成：' + records.length + ' 条');
+            }).catch(function (e) {
+                body.innerHTML = '<div class="sv-error">读取记录失败：' + escapeHtml(describeError(e)) + '</div>';
+            });
+        }
+
+        function renderExplorerControls(ctrlBody) {
+            var ctrl = document.createElement('div');
+            ctrl.className = 'sv-filters';
+            ctrl.innerHTML =
+                '<div class="sv-filter-row">' +
+                '  <label>UID<input id="sv-f-uid" type="text" placeholder="输入 UID（支持部分匹配）"></label>' +
+                '  <label>起始日期<input id="sv-f-from" type="date"></label>' +
+                '  <label>截止日期<input id="sv-f-to" type="date"></label>' +
+                '  <label>页面关键字<input id="sv-f-page" type="text" placeholder="页面标题中包含的字"></label>' +
+                '  <label>系统<select id="sv-f-os"><option value="">全部</option></select></label>' +
+                '  <label>设备类型<select id="sv-f-form"><option value="">全部</option></select></label>' +
+                '  <label>浏览器<select id="sv-f-browser"><option value="">全部</option></select></label>' +
+                '  <button id="sv-f-query" class="sv-btn" type="button">查询</button>' +
+                '  <button id="sv-f-reset" class="sv-btn sv-btn-ghost" type="button">列出全部</button>' +
+                '  <button id="sv-f-reload" class="sv-btn sv-btn-ghost" type="button">重新加载</button>' +
+                '</div>' +
+                '<div id="sv-f-count" class="sv-note"></div>' +
+                '<div id="sv-f-table"></div>';
+            ctrlBody.appendChild(ctrl);
+
+            var uidEl = ctrl.querySelector('#sv-f-uid');
+            var fromEl = ctrl.querySelector('#sv-f-from');
+            var toEl = ctrl.querySelector('#sv-f-to');
+            var pageEl = ctrl.querySelector('#sv-f-page');
+            var osEl = ctrl.querySelector('#sv-f-os');
+            var formEl = ctrl.querySelector('#sv-f-form');
+            var brEl = ctrl.querySelector('#sv-f-browser');
+
+            // 下拉选项：从已加载记录中按 UA 解析去重生成
+            function distinct(acc) {
+                var set = {}, recs = _explorerState.records || [], v;
+                for (var i = 0; i < recs.length; i++) { v = acc(recs[i].ua); if (v) set[v] = true; }
+                return Object.keys(set).sort();
+            }
+            function fill(sel, vals) {
+                if (!sel) return;
+                var h = '<option value="">全部</option>';
+                for (var i = 0; i < vals.length; i++) h += '<option value="' + escapeHtml(vals[i]) + '">' + escapeHtml(vals[i]) + '</option>';
+                sel.innerHTML = h;
+            }
+            fill(osEl, distinct(parseOS));
+            fill(formEl, distinct(parseForm));
+            fill(brEl, distinct(parseBrowser));
+
+            function runQuery() {
+                var criteria = {
+                    uid: uidEl.value,
+                    timeFrom: fromEl.value ? Date.parse(fromEl.value + 'T00:00:00') : null,
+                    timeTo: toEl.value ? Date.parse(toEl.value + 'T23:59:59.999') : null,
+                    page: pageEl.value,
+                    os: osEl.value,
+                    form: formEl.value,
+                    browser: brEl.value
+                };
+                renderExplorer(body, _explorerState.records, criteria);
+            }
+
+            ctrl.querySelector('#sv-f-query').addEventListener('click', runQuery);
+            ctrl.querySelector('#sv-f-reset').addEventListener('click', function () {
+                uidEl.value = ''; fromEl.value = ''; toEl.value = ''; pageEl.value = '';
+                osEl.value = ''; formEl.value = ''; brEl.value = '';
+                renderExplorer(body, _explorerState.records, {});
+            });
+            ctrl.querySelector('#sv-f-reload').addEventListener('click', function () {
+                _explorerState.records = null;
+                ensureLoaded();
+            });
+            uidEl.addEventListener('keydown', function (e) { if (e.key === 'Enter') runQuery(); });
+        }
+
+        toggle.addEventListener('click', function () {
+            if (body.style.display === 'none') {
+                body.style.display = 'block';
+                ensureLoaded();
+            } else {
+                body.style.display = 'none';
+            }
+        });
+    }
+
+    // ---- 一次性把旧原始分片迁成汇总页（控制台调用：StatsViewer.backfill()） ----
+    StatsViewer.backfill = function (site) {
+        site = site || (typeof mw !== 'undefined' && mw.config.values && mw.config.values.wgGameName) || '';
+        if (typeof NGBASE === 'undefined') { if (window.console) console.warn('[stats-viewer] NGBASE 未就绪（需先引入 MediaWiki:Api.js）'); return; }
+        if (typeof AnalyticsStore === 'undefined') { if (window.console) console.warn('[stats-viewer] 需先引入 analytics.js 才能 backfill'); return; }
+        var nb = withThrottle(new NGBASE());
+        var sstore = AnalyticsStore.createSummaryStore({
+            read: function (k) { return nb.read(k); },
+            save: function (k, d) { return nb.save(k, d); }
+        });
+        if (window.console) console.info('[stats-viewer] 开始汇总迁移（扫描原始分片）…');
+        return apiListPages('GLOBAL/').then(function (titles) {
+            var RE = rawPageRegex(site);
+            var pageTitles = [];
+            for (var i = 0; i < titles.length; i++) {
+                var m = RE.exec(titles[i]);
+                if (!m) continue;
+                if (m[3] !== site) continue;
+                pageTitles.push(m[1]);
+            }
+            if (window.console) console.info('[stats-viewer] 待迁移页面 ' + pageTitles.length + ' 个');
+            return mapLimit(pageTitles, CONCURRENCY, function (title) {
+                return fetchPage(nb, title, site).then(function (p) {
+                    if (!p) return;
+                    var logs = p.logs || [];
+                    return mapLimit(logs, CONCURRENCY, function (rec) {
+                        return sstore.record(site, title, rec).catch(function () {});
+                    });
+                });
+            });
+        }).then(function () {
+            if (window.console) console.info('[stats-viewer] 汇总迁移完成，请刷新报表页');
+        });
+    };
+
+
+    StatsViewer._boot = boot;
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', boot);
+    } else {
+        setTimeout(boot, 0);
+    }
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+
+</script>
